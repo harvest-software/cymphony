@@ -17,9 +17,18 @@ defmodule CymphonyElixir.Cymphony.Defaults do
   # GitLab was supported describes a GitHub repository.
   @forge "github"
   @branch_name_template "{{ issue.identifier }}"
+  # Branch a run is cut from when its issue has no parent. An issue with a
+  # parent branches off the parent's branch instead.
+  @base_branch "main"
   @queued_states ["Todo"]
   @in_progress_state "In Progress"
   @state_field "State"
+  # An issue carrying this tag is a container for a feature branch, not work:
+  # never dispatched, and its children branch off it.
+  @feature_branch_label "Feature Branch"
+  # Second, explicit opt-in for a child whose parent carries no container tag.
+  @version_field "Version"
+  @merge_to_parent_version "Merge to Parent Feature Branch"
   @review_state "Human Review"
   @merge_state "Merging"
   @active_states ["Todo", "In Progress", "Merging", "Rework"]
@@ -59,6 +68,12 @@ defmodule CymphonyElixir.Cymphony.Defaults do
   def branch_name_template, do: @branch_name_template
 
   @doc """
+  Default base branch for an issue with no parent.
+  """
+  @spec base_branch() :: String.t()
+  def base_branch, do: @base_branch
+
+  @doc """
   States meaning "queued, not started" — the dispatch transition and the
   blocker gate key off these. Mirrors `Config.Schema`'s `tracker.queued_states`.
   """
@@ -76,6 +91,24 @@ defmodule CymphonyElixir.Cymphony.Defaults do
   """
   @spec state_field() :: String.t()
   def state_field, do: @state_field
+
+  @doc """
+  Tag marking an issue as a feature-branch container rather than work.
+  """
+  @spec feature_branch_label() :: String.t()
+  def feature_branch_label, do: @feature_branch_label
+
+  @doc """
+  Custom field holding the release version.
+  """
+  @spec version_field() :: String.t()
+  def version_field, do: @version_field
+
+  @doc """
+  Version value meaning "branch off my parent, not the configured base".
+  """
+  @spec merge_to_parent_version() :: String.t()
+  def merge_to_parent_version, do: @merge_to_parent_version
 
   @doc """
   State the agent moves an issue to when it hands the change to a human.

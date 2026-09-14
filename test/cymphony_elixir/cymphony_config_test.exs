@@ -379,7 +379,8 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
 
     test "a repo URL that is not an scp-style git@ remote is cloned verbatim" do
       https = CymphonyConfig.to_schema_map(%{"github_repo_url" => "  https://github.com/me/repo.git  "})
-      assert https["hooks"]["after_create"] == "git clone --depth 1 https://github.com/me/repo.git .\n"
+      assert https["hooks"]["after_create"] =~ "git clone --depth 1 https://github.com/me/repo.git ."
+      refute https["hooks"]["after_create"] =~ "  https://"
 
       ssh_url = CymphonyConfig.to_schema_map(%{"repo_url" => "ssh://git@gitlab.example.com/group/repo.git"})
       assert ssh_url["hooks"]["after_create"] =~ "git clone --depth 1 ssh://git@gitlab.example.com/group/repo.git"
@@ -405,8 +406,10 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
       # token the operator may not have.
       ssh = %{"repo_url" => "git@gitlab.example.com:group/sub/repo.git", "rewrite_ssh_remote" => false}
 
-      assert CymphonyConfig.to_schema_map(ssh)["hooks"]["after_create"] ==
-               "git clone --depth 1 git@gitlab.example.com:group/sub/repo.git .\n"
+      assert CymphonyConfig.to_schema_map(ssh)["hooks"]["after_create"] =~
+               "git clone --depth 1 git@gitlab.example.com:group/sub/repo.git ."
+
+      refute CymphonyConfig.to_schema_map(ssh)["hooks"]["after_create"] =~ "https://"
 
       # Only an explicit false opts out.
       for keep <- [true, "false", nil, 0] do

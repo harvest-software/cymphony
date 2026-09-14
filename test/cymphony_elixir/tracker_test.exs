@@ -48,6 +48,25 @@ defmodule CymphonyElixir.TrackerTest do
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
   end
 
+  test "fetch_descendant_ids/2 is optional and says so rather than crashing" do
+    # A tracker that cannot express "children of" must not take a scoped
+    # project down; the caller degrades to filtering on parent_identifier.
+    assert Tracker.fetch_descendant_ids("HFE-6470", memory_config()) == {:error, :not_supported}
+    assert Tracker.fetch_descendant_ids("HFE-6470", linear_config()) == {:error, :not_supported}
+  end
+
+  test "fetch_descendant_ids/2 delegates when the adapter implements it" do
+    Application.put_env(:cymphony_elixir, :youtrack_client_module, __MODULE__.SubtreeStub)
+    on_exit(fn -> Application.delete_env(:cymphony_elixir, :youtrack_client_module) end)
+
+    assert Tracker.fetch_descendant_ids("HFE-6470", youtrack_config()) == {:ok, ["HFE-6470", "HFE-6471"]}
+  end
+
+  defmodule SubtreeStub do
+    @moduledoc false
+    def fetch_descendant_ids("HFE-6470", _config), do: {:ok, ["HFE-6470", "HFE-6471"]}
+  end
+
   test "config-arity reads and writes delegate through the given adapter", %{issue: issue, todo: todo} do
     config = memory_config()
 

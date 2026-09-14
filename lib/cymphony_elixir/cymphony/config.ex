@@ -883,6 +883,7 @@ defmodule CymphonyElixir.Cymphony.Config do
     base
     |> Map.put("forge", forge(config))
     |> Map.put("branch_name_template", tracker_state(config, "branch_name_template", Defaults.branch_name_template()))
+    |> Map.put("base_branch", tracker_state(config, "base_branch", Defaults.base_branch()))
     |> maybe_put_string(config, "forge_token", "forge_token")
     |> maybe_put_string(config, "forge_host", "forge_host")
     |> maybe_put_server(config)
@@ -915,10 +916,17 @@ defmodule CymphonyElixir.Cymphony.Config do
       "review_state" => tracker_state(config, "review_state", Defaults.review_state()),
       "merge_state" => tracker_state(config, "merge_state", Defaults.merge_state()),
       "active_states" => state_list(config, "active_states", Defaults.active_states()),
-      "terminal_states" => state_list(config, "terminal_states", Defaults.terminal_states())
+      "terminal_states" => state_list(config, "terminal_states", Defaults.terminal_states()),
+      # `tracker_state/3` and not `maybe_put_string/4`: a blank value here is
+      # meaningful (it switches the container rule off) and must survive into
+      # the front matter rather than being dropped back to the default.
+      "feature_branch_label" => tracker_state(config, "feature_branch_label", Defaults.feature_branch_label()),
+      "version_field" => tracker_state(config, "version_field", Defaults.version_field()),
+      "merge_to_parent_version" => tracker_state(config, "merge_to_parent_version", Defaults.merge_to_parent_version())
     }
     |> maybe_put_string(config, "endpoint", "tracker_endpoint")
     |> maybe_put_string(config, "assignee", "tracker_assignee")
+    |> maybe_put_string(config, "scope_issue", "scope_issue")
   end
 
   # Which code-hosting platform the repo lives on. Drives the prompt's CLI and
@@ -1254,8 +1262,26 @@ defmodule CymphonyElixir.Cymphony.Config do
 
       repo ->
         clone_url = if rewrite_ssh_remote?(config), do: https_clone_url(repo), else: repo
-        Map.put(base, "hooks", %{"after_create" => "git clone --depth 1 #{clone_url} .\n"})
+        Map.put(base, "hooks", %{"after_create" => clone_command(clone_url)})
     end
+  end
+
+  # The base branch is per *issue* (an issue branches off its parent's branch)
+  # while this hook is generated per *project*, so it cannot be interpolated
+  # here — `Workspace` exports it to the hook as `CYMPHONY_BASE_BRANCH`.
+  #
+  # The `||` fallback covers a parent branch that does not exist on the remote
+  # yet, which is the normal state of affairs for the first sub-task of a new
+  # parent: clone the default branch instead and let the prompt tell the agent
+  # to create and push the base branch.
+  defp clone_command(clone_url) do
+    """
+    if [ -n "${CYMPHONY_BASE_BRANCH:-}" ]; then
+      git clone --depth 1 --branch "$CYMPHONY_BASE_BRANCH" #{clone_url} . || git clone --depth 1 #{clone_url} .
+    else
+      git clone --depth 1 #{clone_url} .
+    fi
+    """
   end
 
   @doc """

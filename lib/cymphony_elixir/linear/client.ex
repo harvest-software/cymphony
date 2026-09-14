@@ -4,7 +4,7 @@ defmodule CymphonyElixir.Linear.Client do
   """
 
   require Logger
-  alias CymphonyElixir.{Config, Linear.Issue}
+  alias CymphonyElixir.{Config, Cymphony.Defaults, Linear.Issue}
 
   @issue_page_size 50
   @project_page_size 50
@@ -34,6 +34,14 @@ defmodule CymphonyElixir.Linear.Client do
             name
           }
         }
+        parent {
+          identifier
+          labels {
+            nodes {
+              name
+            }
+          }
+        }
         inverseRelations(first: $relationFirst) {
           nodes {
             type
@@ -42,6 +50,14 @@ defmodule CymphonyElixir.Linear.Client do
               identifier
               state {
                 name
+              }
+              parent {
+                identifier
+                labels {
+                  nodes {
+                    name
+                  }
+                }
               }
             }
           }
@@ -79,6 +95,14 @@ defmodule CymphonyElixir.Linear.Client do
             name
           }
         }
+        parent {
+          identifier
+          labels {
+            nodes {
+              name
+            }
+          }
+        }
         inverseRelations(first: $relationFirst) {
           nodes {
             type
@@ -87,6 +111,14 @@ defmodule CymphonyElixir.Linear.Client do
               identifier
               state {
                 name
+              }
+              parent {
+                identifier
+                labels {
+                  nodes {
+                    name
+                  }
+                }
               }
             }
           }
@@ -815,6 +847,9 @@ defmodule CymphonyElixir.Linear.Client do
       branch_name: issue["branchName"],
       url: issue["url"],
       assignee_id: assignee_field(assignee, "id"),
+      parent_identifier: get_in(issue, ["parent", "identifier"]),
+      version: nil,
+      branch_from_parent: branch_from_parent?(issue),
       blocked_by: extract_blockers(issue),
       labels: extract_labels(issue),
       assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
@@ -925,7 +960,9 @@ defmodule CymphonyElixir.Linear.Client do
             %{
               id: blocker_issue["id"],
               identifier: blocker_issue["identifier"],
-              state: get_in(blocker_issue, ["state", "name"])
+              state: get_in(blocker_issue, ["state", "name"]),
+              parent_identifier: get_in(blocker_issue, ["parent", "identifier"]),
+              branch_from_parent: branch_from_parent?(blocker_issue)
             }
           ]
         else
@@ -938,6 +975,43 @@ defmodule CymphonyElixir.Linear.Client do
   end
 
   defp extract_blockers(_), do: []
+
+  # Linear has no version field, so only the container label decides: an issue
+  # whose parent carries `tracker.feature_branch_label` cuts from the parent's
+  # branch. The comparison is case-insensitive because `extract_labels/1`
+  # downcases while YouTrack's adapter does not, and the same configured label
+  # has to match on both.
+  defp branch_from_parent?(issue) do
+    case get_in(issue, ["parent", "identifier"]) do
+      parent when is_binary(parent) and parent != "" ->
+        wanted = normalized_label(feature_branch_label())
+
+        wanted != nil and
+          issue
+          |> get_in(["parent", "labels", "nodes"])
+          |> List.wrap()
+          |> Enum.any?(&(normalized_label(&1["name"]) == wanted))
+
+      _ ->
+        false
+    end
+  end
+
+  defp feature_branch_label do
+    case Config.settings() do
+      {:ok, %{tracker: %{feature_branch_label: value}}} -> value
+      _ -> Defaults.feature_branch_label()
+    end
+  end
+
+  defp normalized_label(value) when is_binary(value) do
+    case value |> String.trim() |> String.downcase() do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalized_label(_value), do: nil
 
   defp parse_datetime(nil), do: nil
 

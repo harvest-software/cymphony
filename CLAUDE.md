@@ -42,6 +42,7 @@ Defined in `lib/cymphony_elixir/cli.ex`.
 | `effort <level>` | `--effort <level>` | Reasoning effort passed to the agent CLI |
 | `c <value>` | `--provider <value>` | Provider rotation (comma-separated auth aliases) |
 | `cr <n>` | `--concurrency <n>` | Set max concurrent agents |
+| `issue <id>` | `--issue <id>` | Poll only that issue and its descendants |
 | `port <n>` | `--port <n>` | Set HTTP server / dashboard port |
 | `setup` | `--setup` | Run onboarding wizard |
 | `add` | `add-project` | Add a project to config |
@@ -97,6 +98,7 @@ hardcoded `~`:
 | `~/.cymphony/daemon.log` | `:logger_std_h` (file, 2 MB × 2) | `warning`+ only, plainly named and tailable |
 | `~/.cymphony/daemon.out` | `nohup` redirect | Raw daemon stdout/stderr — status TUI repaints plus any pre-Logger crash |
 | `~/.cymphony/cymphony.pid` | `--daemon-internal` | Daemon OS pid |
+| `~/.cymphony/repos/<project>.git` | `DependencyGate` | Bare mirror for merge checks — never inside a workspace |
 
 Both file handlers buffer and `System.halt/1` does not unwind the VM, so every exit path goes
 through `CLI.halt/1`, which calls `Logger.flush()` first; without it a startup failure leaves both
@@ -109,6 +111,173 @@ There must stay exactly one `System.halt/1` call site in `lib/`, inside `CLI.hal
 `mix test` appends the whole suite's warning noise — raw agent stdout included — to the real
 `~/.cymphony/daemon.log` and rotates it. `LogFileTest` unsets both to exercise the config-dir
 defaults and must **restore** them in `on_exit`, not delete them.
+
+### Polling scope (`issue <id>` / `scope_issue`)
+
+```bash
+cymphony project HFE issue HFE-6470 cr 3   # only HFE-6470 and its sub-tasks
+```
+
+Restricts polling to one issue **and its whole descendant subtree, at any depth**. The root
+is in scope too, so a leaf id scopes the run to that single ticket. Persisted as
+`projects[].scope_issue` and generated into `tracker.scope_issue`. Absent/blank polls the
+whole project; an empty resolved set means *unscoped*, never *nothing in scope* (a project
+with no `scope_issue` must not poll nothing).
+
+The subtree can't be rebuilt from the polled candidates — an issue carries only its
+immediate parent, and an intermediate ancestor may itself be inactive and so absent from
+that set. `YouTrack.Client.fetch_descendant_ids/2` walks it breadth-first instead, one
+`subtask of: {…}` query per level (`Query.subtree/1`), with a visited set (YouTrack permits
+link cycles) and a 10-level cap. `YouTrack.Scope` caches the resolved ids in
+`persistent_term` for 60s — the poll runs every 5s and a subtree changes on the order of
+days.
+
+Applied the way state is: **narrowed in the query, verified locally**. The `issue id:`
+clause is an optimization (dropped past 200 ids); `in_scope?/2` in `decode_issues/5` is the
+correctness boundary. A resolution failure **fails the tick** rather than falling back to an
+unscoped poll — dispatching across the whole board is the opposite of what scoping asked
+for.
+
+`Tracker.fetch_descendant_ids/2` is an **optional** callback (`@optional_callbacks`), called
+through `apply/3` so the adapters that don't export it aren't a compile warning. Linear and
+`Tracker.Memory` answer `{:error, :not_supported}`.
+
+### Dependency gating (`DependencyGate`)
+
+An epic whose sub-tasks each land a branch into the epic branch needs a stronger question
+than "is the dependency's ticket terminal?": a reviewer closes the ticket before the merge,
+an approved MR sits unmerged, a branch gets reverted, and the dependent then builds on code
+that is not on the branch it is cutting from.
+
+`queued_issue_blocked_by_non_terminal?/4` consults `CymphonyElixir.DependencyGate` (a
+per-project GenServer under `ProjectSupervisor`, registered `{project, :dependency_gate}`,
+started only when the project has a `repo_url`). Per dependency:
+
+1. no mirror / base ref missing / dependency branch missing → **tracker state decides**
+   (branch missing is squash-then-delete *and* never-started, indistinguishable from here)
+2. `git merge-base --is-ancestor <dep> <base>` → **merged**
+3. else the forge (`glab mr list --source-branch … --target-branch … --state merged`, or
+   `gh pr list --head … --base …`) → **merged** if it returns a row
+4. else **blocked**
+
+Step 3 is not optional: sub-task MRs are squash-merged, which rewrites the commits, so a
+squashed dependency is **never** an ancestor of the base. Ancestry is the fast local
+pre-check; the forge is the authority.
+
+**Merge is the stronger claim in both directions** — a landed branch unblocks an open
+ticket, and an unlanded branch keeps blocking a `Fixed` one.
+
+**The base in step 2/3 is the *dependency's*, not the dependent's.** "Has this dependency
+landed where it was supposed to land?" — resolved by `PromptBuilder.blocker_base_branch/2`
+from the entry's own `parent_identifier` + `branch_from_parent`, which is why `blocked_by`
+entries carry those two fields at all. Asking instead whether the dependency is present on
+the branch the *dependent* is cutting from deadlocks across a base-branch boundary: a
+sub-task merged into an epic branch is not on the repository default and never will be until
+the whole epic lands. An entry with no policy — every tracker but YouTrack supplies none —
+falls back to the dependent's base, which is the behaviour that predates this.
+
+The gate never does IO on the dispatch path: `merged?/3` answers from cache
+(`:merged` | `:blocked` | `:pending` | `:unknown`) and resolves in a `Task`. `:merged` is
+permanent; `:blocked` and `:unknown` expire after 60s and **both** are answered from cache
+while refreshing — returning `:pending` for a cached `:unknown` would re-queue a resolution
+every tick and never let the caller fall back to tracker state. A git or CLI failure is
+`:unknown`, never `:blocked`: failing closed on infrastructure trouble wedges a whole
+project with nothing to show an operator why.
+
+The bare mirror lives at `~/.cymphony/repos/<project>.git` — never inside a workspace, whose
+root is a cloned repo the agent commits and pushes from. The dispatch-skip log names each
+blocking dependency and its reason (`HFE-6472(unmerged)`), not a bare count.
+
+`forge_query/3` and `forge_verdict/4` are public so the three CLI outcomes are testable
+without `glab`/`gh` installed; the module is in `mix.exs` `ignore_modules` like the other
+shell-out modules (`Workspace`, `YouTrack.Client`, `Agent.Runner`).
+
+### Base branches (`base_branch`)
+
+`origin/main` was hardcoded in six places in the prompt. It is now
+`origin/{{ base_branch }}`, resolved by `PromptBuilder.base_branch/2`:
+
+```
+issue.branch_from_parent && issue.parent_identifier   (the DIRECT parent, one level up)
+      -> PromptBuilder.branch_name(PromptBuilder.issue_for(parent), template)
+      -> config.base_branch    (top-level key, default "main")
+      -> "main"
+```
+
+Only one level is walked — the chain composes because each parent resolves its own base the
+same way, so a grandchild targets its parent and not the root of the tree. The same value
+feeds the prompt, the clone hook and the gate.
+
+**Having a parent is not enough, and this is the part that bites.** Most trackers give every
+ticket a parent of some kind; branching off all of them would put unrelated work on each
+other's branches. `branch_from_parent` is the opt-in, and the adapter sets it when **either**
+the direct parent carries `tracker.feature_branch_label` (default `Feature Branch`) **or** the
+issue's own `tracker.version_field` (default `Version`) equals
+`tracker.merge_to_parent_version` (default `Merge to Parent Feature Branch`). Tagging the epic
+once opts in every child, which is how it is actually used — in practice operators tag the
+container and leave the version field unset on most sub-tasks.
+
+The decision is made **at decode time in the adapter**, not in `PromptBuilder`: it needs the
+*parent's* tags, and no child payload carries them. `PromptBuilder.base_branch/2` therefore
+stays a pure function of one boolean field, callable from the prompt render, the clone-hook
+env and the gate alike.
+
+`YouTrack.BranchPolicy` is what supplies those tags — a `persistent_term` cache (60s TTL,
+`:branch_policy_cache_ttl_ms`) modelled on `YouTrack.Scope`. `Client.decode_issues/5` seeds it
+with the batch's own tags (an active epic is usually right there) and resolves the remainder
+in **one** batched `issue id: {…}` request per page. A failed lookup is "not a container",
+logged: degrading to the configured base shows a human the wrong base on the review, whereas
+the opposite error silently retargets work onto a branch it was never meant to touch.
+
+`parent_identifier` is new on `%Linear.Issue{}`. YouTrack reads it from the **child** end of
+the Subtask link only (`@parent_phrases ["subtask of", "is subtask of"]`): the link is stored
+once with `sourceToTarget: "parent for"`, so an epic reading its own links would otherwise
+become a subtask of its own first child. Linear reads `parent { identifier }`.
+
+**The review target is enforced, not just stated.** The Branch section names the base ~180
+lines above the step where the agent actually opens the review, and a target repository need
+not ship a skill that gets it right (a forge CLI given no base flag silently targets the
+repository default). So the execution flow names the command at the point of use
+(`{{ forge.cli }} {{ forge.review_open_command }} {{ forge.review_base_flag }} {{ base_branch }}`),
+then reads the target back (`forge.review_target_command`) and retargets
+(`forge.review_retarget_command`) when it is wrong. That read-back also runs on rework
+re-entry, which is the only thing that corrects a review opened before the issue gained its
+parent. The prompt also instructs the agent to create and push `origin/<base>` from the
+repository default branch if it does not exist — the normal state before the first sub-task of
+a new parent runs.
+
+### Feature-branch containers
+
+An issue tagged `tracker.feature_branch_label` holds the branch its children merge into and
+has no change of its own to make, so it is **never dispatched** — an agent sent at it would
+invent something to do on the branch every sub-task is about to cut from.
+
+`candidate_issue?/4` is the single choke point (`waiting_eligible?/4`,
+`should_dispatch_issue?/4` and both `retry_candidate_issue?` clauses all route through it), so
+the tag is filtered out **before** the issue reaches `waiting` rather than rendered as a
+permanently held card: a board running several epics would otherwise read as a wall of blocked
+rows for tickets nobody intends to run. A `Logger.debug` names each one, which is what answers
+"why is HFE-6470 not running".
+
+The comparison is case-insensitive and trimmed. That is load-bearing: the Linear adapter
+downcases label names and the YouTrack adapter does not, so an exact match would work on one
+tracker and not the other.
+
+`PromptBuilder.issue_for/1` exists because `branch_name/2` renders through
+`Map.from_struct/1`: a bare map raises, is rescued, and quietly degrades to the identifier,
+silently dropping the `feature/` from a template like `feature/{{ issue.identifier }}`.
+
+**Hook environment.** The clone hook is generated per *project* while the base branch is per
+*issue*, so `Workspace.run_hook/6` exports `CYMPHONY_BASE_BRANCH`, `CYMPHONY_BRANCH_NAME` and
+`CYMPHONY_ISSUE` (local `System.cmd` `env:`, remote leading `export` lines) and the generated
+hook reads it:
+
+```sh
+git clone --depth 1 --branch "$CYMPHONY_BASE_BRANCH" <url> . || git clone --depth 1 <url> .
+```
+
+The `||` covers a parent branch that does not exist on the remote yet. A hook invoked
+without an issue (stale sweep, removal) exports none of them.
 
 ### Concurrency control
 
@@ -380,6 +549,8 @@ CymphonyElixir.Supervisor (one_for_one)
 ├── Task.Supervisor (for AgentRunner tasks)
 ├── DynamicSupervisor (ProjectDynamicSupervisor)
 │   └── ProjectSupervisor (per project)
+│       ├── DependencyGate (only when the project has a repo_url; first, so the
+│       │                   first poll tick can already get a merge verdict)
 │       ├── WorkflowStore
 │       └── Orchestrator
 ├── HttpServer (Bandit + Phoenix)
@@ -444,10 +615,20 @@ Things that bite:
 - The search query narrows by project and state; the decoded issues are then
   filtered by state name locally, so a query-syntax surprise cannot leak a
   non-active issue into a dispatch.
+- **The linked-issue selection nests one more `links` level**, so each blocker carries its
+  own parent. Without it the gate has no policy for a dependency and silently falls back to
+  the dependent's base on every one of them.
+- **`Version` is read by a configurable name** (`tracker.version_field`), for the same reason
+  `state_field` is: a project that renames it would read `nil` and silently opt every issue
+  out of parent-branching. `custom_field_name/2` handles a multi-value field (a list value)
+  as well as the single-object `SingleVersionIssueCustomField` a stock instance returns.
 - Blockers come from `links`, matching the phrase for *this* end of the link
   (`sourceToTarget` for `OUTWARD`, `targetToSource` for `INWARD`, else the type
   name) against `depends on` / `is blocked by` / `blocked by`. `subtask of` is
-  deliberately excluded — a subtask is not blocked by its parent.
+  deliberately excluded from *blockers* — a subtask is not blocked by its
+  parent — but the same direction-aware phrase match reads it for
+  `parent_identifier`, which is where the base branch comes from. Only the
+  child end counts: see "Base branches" above.
 - A `404` refreshing a running issue means "no longer active", not a failed
   reconcile pass.
 - Agents get `YOUTRACK_URL`/`YOUTRACK_TOKEN`/`YOUTRACK_PROJECT` in their
@@ -462,7 +643,7 @@ Things that bite:
 (default `"In Progress"`) exist because the words for "queued" and "started"
 belong to the tracker, not to Cymphony. Both the dispatch transition
 (`transition_to_in_progress/2`) and the blocker gate
-(`queued_issue_blocked_by_non_terminal?/3`) read them. Hardcoding `"todo"`
+(`queued_issue_blocked_by_non_terminal?/4`) read them. Hardcoding `"todo"`
 meant a YouTrack project dispatched work but never moved the issue and never
 honored a blocker. A blank `in_progress_state` skips the transition entirely,
 for a workflow that has no such state. `active_states`/`terminal_states` are
@@ -531,6 +712,11 @@ credentials — it changes what the agent is *told to do*.
   never reads it. Never hardcode `gh`, `PR` or `GitHub` back into
   `PromptTemplate`; `prompt_builder_forge_test.exs` refutes each of them in the
   GitLab rendering.
+- **The base branch is the issue's parent, not the repository default.** See
+  "Base branches" above: `origin/{{ base_branch }}` replaced a hardcoded
+  `origin/main` throughout `PromptTemplate`, and `forge.review_base_flag`
+  (`--target-branch` / `--base`) makes the review target explicit. Never
+  hardcode `origin/main` back into the template.
 - **The branch name is config, not the agent's invention.** `branch_name_template`
   (top-level, default `{{ issue.identifier }}`) is rendered against the issue by
   `PromptBuilder.branch_name/2` and reaches the prompt as `{{ branch_name }}`,

@@ -445,6 +445,37 @@ Note:
   characters dropped, edges trimmed). A template that renders blank or fails falls back to the
   issue identifier and logs a warning.
 
+#### 5.3.0.2 `base_branch` (string)
+
+- The branch a run is cut from, and the branch its review targets, **unless the issue is
+  opted in to branching off its parent**. Default: `main`.
+- An opted-in issue branches off its parent's branch instead: the parent's identifier put
+  through `branch_name_template`. Only **one** level is walked — the chain composes because
+  each parent, when it runs, resolves its own base by the same rule, so a grandchild
+  targets its parent and not the root of the tree.
+- **Having a parent is not on its own enough.** Most trackers give every ticket a parent of
+  some kind, and branching off all of them would put unrelated work on each other's
+  branches. An issue is opted in when **either**:
+  - its **direct parent** carries `tracker.feature_branch_label` (default `Feature Branch`)
+    — tagging the container once opts in every child, which is the normal operating mode; or
+  - its own `tracker.version_field` (default `Version`) equals
+    `tracker.merge_to_parent_version` (default `Merge to Parent Feature Branch`) — an
+    explicit per-issue opt-in for a parent that carries no tag.
+- The decision is made **at decode time in the tracker adapter** and carried on the issue,
+  because it needs the *parent's* tags and an issue payload never has them. Base-branch
+  resolution itself stays a pure function of one field.
+- Reaches the prompt as `{{ base_branch }}`. Every instruction that names a branch to sync
+  with, merge from, or re-cut from renders as `origin/{{ base_branch }}`; none may hardcode
+  a default branch name.
+- The prompt must state the review's base explicitly (`--base` / `--target-branch`), because
+  the forge CLI otherwise targets the repository's default branch.
+- If `origin/<base>` does not exist on the remote, the agent creates it from the repository
+  default branch and pushes it. That is the normal state before the first sub-task of a new
+  parent runs, and is not a blocker.
+- The clone hook is generated **per project** while the base branch is **per issue**, so the
+  base reaches the hook through the environment rather than being interpolated, and the
+  hook falls back to a plain clone when the base branch does not exist yet.
+
 #### 5.3.1 `tracker` (object)
 
 Fields:
@@ -505,6 +536,25 @@ Fields:
 - `terminal_states` (list of strings)
   - Default: `Closed`, `Cancelled`, `Canceled`, `Duplicate`, `Done`
   - Per-project override: `projects[].terminal_states`, same validation as `active_states`.
+- `scope_issue` (string, optional)
+  - Restricts polling to this issue and its descendants, at any depth; the issue itself is
+    in scope, so a leaf id scopes the run to that one ticket. Absent or blank polls the
+    whole project. See "Polling scope" in Section 8.1 for the resolution and filtering
+    rules.
+  - Set by the `issue <id>` CLI shorthand, persisted as `projects[].scope_issue`.
+- `feature_branch_label` (string, default `"Feature Branch"`)
+  - Tag/label marking an issue as a **container** for a feature branch rather than work in
+    its own right. Such an issue is never dispatched (Section 8.2), and its children cut
+    their branches from it (Section 5.3.0.2). Blank switches both behaviours off.
+  - Matched case-insensitively and trimmed, because one adapter downcases label names and
+    the other does not.
+- `version_field` (string, default `"Version"`) and `merge_to_parent_version` (string,
+  default `"Merge to Parent Feature Branch"`)
+  - The custom field read for the per-issue opt-in, and the value of it that means "branch
+    off my parent". Configurable for the same reason `state_field` is: a project that
+    renames the field would otherwise read `nil` and silently opt every issue out.
+  - YouTrack only. Trackers with no version concept leave the field unset, so only the
+    container tag opts an issue in.
 
 ##### YouTrack adapter specifics (`tracker.kind == "youtrack"`)
 
@@ -970,6 +1020,12 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `tracker.project_slug`: string, required when `tracker.kind=linear`
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
+- `tracker.scope_issue`: string, optional; poll only this issue and its descendants
+- `tracker.feature_branch_label`: string, default `"Feature Branch"`; container tag — never
+  dispatched, and children branch off it. Blank disables.
+- `tracker.version_field`: string, default `"Version"`
+- `tracker.merge_to_parent_version`: string, default `"Merge to Parent Feature Branch"`
+- `base_branch`: string, default `"main"`; base unless the issue is opted in to its parent
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path, default `<system-temp>/cymphony_workspaces`
 - `worker.ssh_hosts` (extension): list of SSH host strings, optional; when omitted, work runs
@@ -1162,6 +1218,31 @@ Tick sequence:
 If per-tick validation fails, dispatch is skipped for that tick, but reconciliation still happens
 first.
 
+#### Polling scope (`tracker.scope_issue`)
+
+A project may restrict polling to one issue and its descendants. The scope is **the named
+issue plus its whole subtree, at any depth**, so one setting covers both "this epic" and
+"just this ticket" — a leaf id scopes the run to itself. Absent or blank polls the whole
+project, and an empty resolved set means *unscoped*, never *nothing in scope*.
+
+The subtree cannot be reconstructed from the polled candidates: an issue carries only its
+immediate parent, and an intermediate ancestor may itself be inactive and so absent from
+that set. It is resolved independently and breadth-first, one request per level, guarded by
+a visited set (link graphs may contain cycles) and a depth cap. Resolution is cached — the
+poll runs every few seconds and a subtree changes on the order of days.
+
+Scope is applied the way state is: **narrowed in the tracker query and verified locally**.
+The query clause is an optimization; the local membership filter is the correctness
+boundary, so a query-syntax surprise cannot leak an out-of-scope issue into a dispatch. A
+very large scope drops the query clause and relies on the local filter alone.
+
+A scope that cannot be resolved fails the tick rather than falling back to an unscoped
+poll — dispatching across the whole board is the opposite of what scoping asked for.
+
+Subtree resolution is an **optional** tracker capability. A tracker that cannot express
+"children of" reports that, and the caller filters on parent links among the polled
+candidates instead, which reaches only ancestors that are themselves active.
+
 ### 8.2 Candidate Selection Rules
 
 Waiting-board membership and dispatch order are **sticky operator order**, not a per-tick
@@ -1184,11 +1265,84 @@ An issue is waiting-eligible (dispatch-ready, not currently running) only if all
 - It is not already in `claimed`.
 - It is not in `retry_attempts` (retry/backoff stays its own list **below** In Progress;
   Section 8.4).
-- Blocker rule for `Todo` state passes:
-  - If the issue state is `Todo`, do not include it when any blocker is non-terminal.
+- It does **not** carry `tracker.feature_branch_label` (see **Feature-branch containers**
+  below).
+- Blocker rule for `Todo` state passes (see **Dependency readiness** below).
 
 Do not put Backlog, canceled, or blocked issues on the board. Hide the board when
 `waiting` is empty (no empty columns). Do not claim waiting ids.
+
+#### Feature-branch containers
+
+An issue tagged `tracker.feature_branch_label` (default `Feature Branch`) holds the branch
+its children merge into. It has no change of its own to make, so it is **never dispatched**:
+an agent sent at it would invent something to do on the branch every sub-task is about to
+cut from.
+
+It is filtered out before reaching the waiting board rather than shown as permanently held
+— a board running several epics would otherwise read as a wall of blocked rows for tickets
+nobody intends to run. A debug log names each one skipped, so "why is this epic not
+running" has an answer.
+
+The same tag is what opts the epic's children into branching off it (Section 5.3.0.2). A
+blank label switches both behaviours off.
+
+#### Dependency readiness
+
+The rule applies **only while the issue is in one of `queued_states`** (`Todo` by
+default); an issue already in progress dispatches with open blockers so an in-flight
+worker can finish what it started.
+
+A dependency is *ready* when its work has landed on the branch it was meant to land on.
+The base used for the check is resolved from the **dependency**, by the same rule as any
+other issue's base (Section 5.3.0.2) — not from the dependent. Asking instead whether the
+dependency sits on the branch the *dependent* is cutting from deadlocks across a
+base-branch boundary: a sub-task merged into an epic branch is not on the repository
+default and never will be until the whole epic lands, so a dependent cutting from there
+would be blocked forever. A dependency entry that carries no policy of its own — every
+tracker but YouTrack supplies none — falls back to the dependent's base.
+
+Tracker state alone cannot establish readiness — a reviewer closes the ticket before the
+merge, an approved review sits unmerged, a branch is reverted — so the answer is taken
+from git and the forge first, with tracker state as the fallback:
+
+| # | Condition | Result |
+|---|---|---|
+| 1 | No mirror for the project (no `repo_url`, clone failed) | fall back to tracker state |
+| 2 | The base branch is not a ref in the mirror | fall back to tracker state |
+| 3 | The dependency's branch is not a ref in the mirror | fall back to tracker state |
+| 4 | `git merge-base --is-ancestor <dep> <base>` succeeds | **ready** |
+| 5 | The forge reports a review from `<dep>` into `<base>` in state merged | **ready** |
+| 6 | Otherwise | **not ready** — the dependent stays queued |
+
+Rule 5 exists because sub-task reviews are routinely squash-merged, which rewrites the
+commits: a squashed dependency is never an ancestor of the base however thoroughly it
+landed. Ancestry is the fast local pre-check; the forge is the authority.
+
+Rule 3 covers squash-then-delete and never-started alike — indistinguishable from the
+mirror, so the ticket is the tie-breaker.
+
+**Merge is the stronger claim in both directions.** A dependency whose branch has landed
+is ready even while its ticket is open; a dependency whose branch demonstrably has not
+landed is not ready even when its ticket is terminal.
+
+A blocker whose state cannot be read fails closed.
+
+The check must not do IO on the dispatch path: verdicts are served from a per-project
+cache and resolved out of band. An unresolved pair holds the dependent for that tick only.
+A git or forge failure yields "cannot answer" — never "not ready" — so unavailable
+infrastructure degrades to the tracker-state behaviour instead of wedging a project.
+
+The dispatch-skip log names each dependency still holding an issue and which rule held it.
+
+#### Review target
+
+The base branch is only useful if the review actually targets it. The prompt therefore
+names the create command **at the step where the review is opened**, with the base flag
+spelled out, and then reads the target back and retargets it if it is wrong. The read-back
+also runs on re-entry for an already-attached review, which is what corrects one opened
+before the issue gained its parent. A repository is not assumed to ship a skill that gets
+this right, and a forge CLI given no base flag silently targets the repository default.
 
 Global / per-state / per-host slot checks are **not** membership filters; they apply when
 walking `waiting` to dispatch (below).
@@ -1466,6 +1620,11 @@ Execution contract:
   conforming default.
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
 - Log hook start, failures, and timeouts.
+- Hooks run with `CYMPHONY_BASE_BRANCH`, `CYMPHONY_BRANCH_NAME` and `CYMPHONY_ISSUE`
+  exported when the hook was invoked for a known issue. The clone hook is generated once
+  per project while the base branch is per issue, so the base cannot be interpolated into
+  the command and has to be read from the environment. A hook invoked without an issue (a
+  stale-workspace sweep, a removal) exports none of them.
 
 Failure semantics:
 

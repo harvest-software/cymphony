@@ -41,6 +41,18 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
   a prefix or a suffix to it. If that branch already exists (locally or on the
   remote) continue on it rather than creating a variant.
 
+  Cut it from `origin/{{ base_branch }}`, and open the {{ forge.review_abbr }}
+  against `{{ base_branch }}` — pass the base explicitly
+  (`{{ forge.cli }} ... {{ forge.review_base_flag }} {{ base_branch }}`) rather
+  than relying on the repository default branch, which is not necessarily the
+  base for this issue. Every instruction below that names
+  `origin/{{ base_branch }}` means this branch and no other.
+
+  If `origin/{{ base_branch }}` does not exist on the remote, create it from the
+  repository default branch and push it before cutting your own branch. This is
+  the normal case for the first sub-task of a new parent issue and is not a
+  blocker.
+
   ## Prerequisite: {{ tracker.name }} access
 
   You must be able to read and write the ticket through {{ tracker.access }}. If that is not available, stop and report it as a blocker.
@@ -69,7 +81,7 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
 
   - `commit`: produce clean, logical commits during implementation.
   - `push`: keep remote branch current and publish updates.
-  - `pull`: keep branch updated with latest `origin/main` before handoff.
+  - `pull`: keep branch updated with latest `origin/{{ base_branch }}` before handoff.
   {% if workflow.merge_state %}  - `land`: when ticket reaches `{{ workflow.merge_state }}`, explicitly open and follow `.claude/skills/land/SKILL.md`, which includes the `land` loop.
   {% endif %}
 
@@ -101,7 +113,8 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
      - `{{ workflow.review_state }}` -> do nothing and shut down; a human owns the ticket in this state.
   {% if workflow.merge_state %}   - `{{ workflow.merge_state }}` -> on entry, open and follow `.claude/skills/land/SKILL.md`; do not call `{{ forge.merge_command }}` directly.
   {% endif %}   - A terminal state -> do nothing and shut down.
-  4. Check whether a {{ forge.review_abbr }} already exists for the current branch and whether it is closed.
+  4. Check whether a {{ forge.review_abbr }} already exists for the current branch, whether it is closed, and what it targets.
+     - If an open {{ forge.review_abbr }} targets anything other than `{{ base_branch }}`, retarget it now with `{{ forge.review_retarget_command }} {{ base_branch }}`.
      - If a branch {{ forge.review_abbr }} exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
      - Create a fresh branch named exactly `{{ branch_name }}` and restart execution flow as a new attempt.
   5. For queued tickets, do startup sequencing in this exact order:
@@ -127,7 +140,7 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
   7. For comments such as "please fix merge conflicts on {{ forge.review_abbr }}":
      - Identify the attached/open {{ forge.review_abbr }}.
      - Check out the {{ forge.review_abbr }} branch.
-     - Fetch latest `origin/main`, merge it into the {{ forge.review_abbr }} branch, resolve conflicts, and rerun required validation.
+     - Fetch latest `origin/{{ base_branch }}`, merge it into the {{ forge.review_abbr }} branch, resolve conflicts, and rerun required validation.
      - Push the resolved branch to the existing {{ forge.review_abbr }}.
      - Run the {{ forge.review_abbr }} feedback sweep and checks gate before handoff.
   8. If there are no actionable new human comments and the existing {{ forge.review_abbr }} is healthy, update the workpad checkpoint and return the issue to `{{ workflow.review_state }}`.
@@ -157,7 +170,7 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
       - If the ticket description/comment context includes `Validation`, `Test Plan`, or `Testing` sections, copy those requirements into the workpad `Acceptance Criteria` and `Validation` sections as required checkboxes (no optional downgrade).
   7.  Run a principal-style self-review of the plan and refine it in the comment.
   8.  Before implementing, capture a concrete reproduction signal and record it in the workpad `Notes` section (command/output, screenshot, or deterministic UI behavior).
-  9.  Run the `pull` skill to sync with latest `origin/main` before any code edits, then record the pull/sync result in the workpad `Notes`.
+  9.  Run the `pull` skill to sync with latest `origin/{{ base_branch }}` before any code edits, then record the pull/sync result in the workpad `Notes`.
       - Include a `pull skill evidence` note with:
         - merge source(s),
         - result (`clean` or `conflicts resolved`),
@@ -214,25 +227,32 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
       - If app-touching, run `launch-app` validation and capture/upload media via the review-media skill before handoff.
   6.  Re-check all acceptance criteria and close any gaps.
   7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
-  8.  Attach {{ forge.review_abbr }} URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
+  8.  Open the {{ forge.review_abbr }} if one is not already attached, naming the base explicitly:
+      `{{ forge.cli }} {{ forge.review_open_command }} {{ forge.review_base_flag }} {{ base_branch }}`.
+      - Never omit `{{ forge.review_base_flag }}`. Without it {{ forge.cli }} targets the repository default branch, which is not the base for this issue.
+  9.  Verify the {{ forge.review_abbr }} targets `{{ base_branch }}`, whether you just opened it or it was already attached:
+      - Read the current target with `{{ forge.review_target_command }}`.
+      - If it is anything other than `{{ base_branch }}`, retarget it with `{{ forge.review_retarget_command }} {{ base_branch }}` and read it back again to confirm.
+      - An {{ forge.review_abbr }} opened before this issue gained its parent will still point at the old base; fixing it is part of this run, not a human's job.
+  10. Attach {{ forge.review_abbr }} URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
       - Ensure the {{ forge.name }} {{ forge.review_abbr }} has label `cymphony` (add it if missing).
-  9.  Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
-  10. Update the workpad comment with final checklist status and validation notes.
+  11. Merge latest `origin/{{ base_branch }}` into branch, resolve conflicts, and rerun checks.
+  12. Update the workpad comment with final checklist status and validation notes.
       - Mark completed plan/acceptance/validation checklist items as checked.
       - Add final handoff notes (commit + validation summary) in the same workpad comment.
       - Do not include {{ forge.review_abbr }} URL in the workpad comment; keep {{ forge.review_abbr }} linkage on the issue via attachment/link fields.
       - Add a short `### Confusions` section at the bottom when any part of task execution was unclear/confusing, with concise bullets.
       - Do not post any additional completion summary comment.
-  11. Before moving to `{{ workflow.review_state }}`, poll {{ forge.review_abbr }} feedback and checks:
+  13. Before moving to `{{ workflow.review_state }}`, poll {{ forge.review_abbr }} feedback and checks:
       - Read the {{ forge.review_abbr }} `Manual QA Plan` comment (when present) and use it to sharpen UI/runtime test coverage for the current change.
       - Run the full {{ forge.review_abbr }} feedback sweep protocol.
       - Confirm {{ forge.review_abbr }} checks are passing (green) after the latest changes.
       - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
       - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
       - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
-  12. Only then move issue to `{{ workflow.review_state }}`.
+  14. Only then move issue to `{{ workflow.review_state }}`.
       - Exception: if blocked by missing required tools/auth other than {{ forge.name }} per the blocked-access escape hatch, move to `{{ workflow.review_state }}` with the blocker brief and explicit unblock actions.
-  13. For a queued state tickets that already had a {{ forge.review_abbr }} attached at kickoff:
+  15. For a queued state tickets that already had a {{ forge.review_abbr }} attached at kickoff:
       - Ensure all existing {{ forge.review_abbr }} feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
       - Ensure branch was pushed with any required updates.
       - Then move to `{{ workflow.review_state }}`.
@@ -253,7 +273,7 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
   2. Re-read the full issue body and all human comments; explicitly identify what will be done differently this attempt.
   3. Close the existing {{ forge.review_abbr }} tied to the issue.
   4. Remove the existing `## Claude Workpad` comment from the issue.
-  5. Create a fresh branch from `origin/main`.
+  5. Create a fresh branch from `origin/{{ base_branch }}`.
   6. Start over from the normal kickoff flow:
      - If current issue state is a queued state, move it to `{{ workflow.in_progress_state }}`; otherwise keep the current state.
      - Create a new bootstrap `## Claude Workpad` comment.
@@ -272,7 +292,7 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
   ## Guardrails
 
   - If the branch {{ forge.review_abbr }} is already closed/merged, do not reuse that branch or prior implementation state for continuation.
-  - For closed/merged branch PRs, create a new branch from `origin/main` and restart from reproduction/planning as if starting fresh.
+  - For closed/merged branch PRs, create a new branch from `origin/{{ base_branch }}` and restart from reproduction/planning as if starting fresh.
   - If issue state is a non-workflow state, do not modify it; wait for human to move to a queued state.
   - Do not edit the issue body/description for planning or progress tracking.
   - Use exactly one persistent workpad comment (`## Claude Workpad`) per issue.

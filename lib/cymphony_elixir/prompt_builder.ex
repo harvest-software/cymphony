@@ -34,6 +34,7 @@ defmodule CymphonyElixir.PromptBuilder do
         "issue" => issue |> Map.from_struct() |> to_solid_map(),
         "forge" => forge_variables(Keyword.get(opts, :forge) || forge_kind(config)),
         "branch_name" => branch_name(issue, branch_template(config)),
+        "base_branch" => base_branch(issue, config),
         "workflow" => workflow_variables(config),
         "tracker" => tracker_variables(config)
       },
@@ -59,6 +60,10 @@ defmodule CymphonyElixir.PromptBuilder do
       "review" => "merge request",
       "review_abbr" => "MR",
       "merge_command" => "glab mr merge",
+      "review_base_flag" => "--target-branch",
+      "review_open_command" => "mr create",
+      "review_target_command" => "glab mr view --json targetBranch",
+      "review_retarget_command" => "glab mr update --target-branch",
       "comments_command" => "glab mr view --comments",
       "inline_comments_command" => "glab api projects/:id/merge_requests/<mr>/notes",
       "reviews_command" => "glab mr view --json reviewers,approvalsRequired"
@@ -72,6 +77,10 @@ defmodule CymphonyElixir.PromptBuilder do
       "review" => "pull request",
       "review_abbr" => "PR",
       "merge_command" => "gh pr merge",
+      "review_base_flag" => "--base",
+      "review_open_command" => "pr create",
+      "review_target_command" => "gh pr view --json baseRefName",
+      "review_retarget_command" => "gh pr edit --base",
       "comments_command" => "gh pr view --comments",
       "inline_comments_command" => "gh api repos/<owner>/<repo>/pulls/<pr>/comments",
       "reviews_command" => "gh pr view --json reviews"
@@ -85,6 +94,28 @@ defmodule CymphonyElixir.PromptBuilder do
     do: template
 
   defp branch_template(_config), do: "{{ issue.identifier }}"
+
+  defp configured_base_branch(%{base_branch: base}) when is_binary(base) do
+    case sanitize_branch(base) do
+      "" -> "main"
+      name -> name
+    end
+  end
+
+  defp configured_base_branch(_config), do: "main"
+
+  defp parent_identifier(issue) do
+    case Map.get(issue, :parent_identifier) do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _ ->
+        nil
+    end
+  end
 
   # A template is operator-authored and rendered per issue; a typo in it must
   # degrade to the identifier rather than raise out of the whole prompt build.
@@ -121,6 +152,70 @@ defmodule CymphonyElixir.PromptBuilder do
       "" -> sanitize_branch(identifier)
       name -> name
     end
+  end
+
+  @doc """
+  Branch this run is cut from, and the branch its review targets.
+
+  An issue branches off **its direct parent's branch** — the parent's
+  identifier put through the same `branch_name_template` — when the tracker
+  said it should: `issue.branch_from_parent`, which the adapter sets from the
+  parent's container tag or the issue's own version marker. Only one level is
+  walked: the chain composes because each parent, when it runs, resolves its own
+  base by the same rule.
+
+  Having a parent is **not** on its own enough. Most trackers give every ticket
+  a parent of some kind, and branching off all of them would put unrelated work
+  on each other's branches; the opt-in is what makes the epic case explicit.
+
+  Otherwise the answer is `config.base_branch` (default `main`), which is what
+  the prompt's `origin/{{ base_branch }}` renders to for ordinary standalone
+  issues.
+  """
+  @spec base_branch(term(), term()) :: String.t()
+  def base_branch(issue, config) do
+    with true <- branch_from_parent?(issue),
+         parent when is_binary(parent) <- parent_identifier(issue) do
+      branch_name(issue_for(parent), branch_template(config))
+    else
+      _ -> configured_base_branch(config)
+    end
+  end
+
+  @doc """
+  Base branch for a `blocked_by` entry, from its own parent and policy.
+
+  The dependency gate asks whether a dependency landed where *it* was supposed
+  to land, not whether it is present on the branch the dependent happens to cut
+  from — otherwise a dependency merged into an epic branch blocks a sibling that
+  branches from the repository default, permanently. An entry that carries no
+  policy (any tracker that does not supply one) returns `nil`, and the caller
+  falls back to the dependent's base.
+  """
+  @spec blocker_base_branch(term(), term()) :: String.t() | nil
+  def blocker_base_branch(blocker, config) do
+    with true <- branch_from_parent?(blocker),
+         parent when is_binary(parent) <- parent_identifier(blocker) do
+      branch_name(issue_for(parent), branch_template(config))
+    else
+      _ -> nil
+    end
+  end
+
+  defp branch_from_parent?(issue) when is_map(issue), do: Map.get(issue, :branch_from_parent, false) == true
+  defp branch_from_parent?(_issue), do: false
+
+  @doc """
+  A bare `Issue` struct carrying only `identifier`.
+
+  `branch_name/2` renders the template through `Map.from_struct/1`, so a plain
+  map cannot stand in for an issue: the render raises, is rescued, and quietly
+  degrades to the identifier — which silently drops the `feature/` in a
+  template like `feature/{{ issue.identifier }}`.
+  """
+  @spec issue_for(String.t()) :: CymphonyElixir.Linear.Issue.t()
+  def issue_for(identifier) when is_binary(identifier) do
+    %CymphonyElixir.Linear.Issue{id: identifier, identifier: identifier}
   end
 
   @doc """

@@ -23,6 +23,7 @@ defmodule CymphonyElixir.YouTrack.Issue do
   alias CymphonyElixir.YouTrack.Query
 
   @default_state_field "State"
+  @default_version_field "Version"
   @priority_field "Priority"
   @assignee_field "Assignee"
 
@@ -32,13 +33,34 @@ defmodule CymphonyElixir.YouTrack.Issue do
   # by its parent.
   @blocking_phrases ["depends on", "is blocked by", "blocked by"]
 
+  # Link phrases (as seen *from this issue*) that mean "the other issue is my
+  # parent". Read for `parent_identifier`, which is what the base branch is
+  # derived from — a sub-task branches off its direct parent's branch, not off
+  # the repository default.
+  #
+  # Only the *child* end counts. YouTrack stores the Subtask link once, with
+  # `sourceToTarget: "parent for"` and `targetToSource: "subtask of"`, so an
+  # epic reading its own links sees "parent for" — those linked issues are its
+  # children, not its parent, and treating the phrase as a parent marker would
+  # make every epic a subtask of its own first child.
+  #
+  # These are deliberately *not* in `@blocking_phrases`: a subtask is not
+  # blocked by its parent.
+  @parent_phrases ["subtask of", "is subtask of"]
+
   # `$type` on customFields is what lets a write reuse the field's real type
   # instead of guessing `StateIssueCustomField` (a renamed state field is
   # frequently a plain enum, and the wrong $type is rejected).
+  # The second `links(...)` level reads each *linked* issue's own parent, which
+  # is what lets the dependency gate ask "did this dependency land where it was
+  # supposed to land?" rather than "is it on the branch I am cutting from".
+  # Without it a dependency that merged into the epic branch would block a
+  # dependent that cuts from the repository default, forever.
   @fields "id,idReadable,summary,description,created,updated,tags(name)," <>
             "customFields($type,name,value(name,login)),links(direction," <>
             "linkType(name,sourceToTarget,targetToSource)," <>
-            "issues(id,idReadable,customFields(name,value(name))))"
+            "issues(id,idReadable,customFields(name,value(name))," <>
+            "links(direction,linkType(sourceToTarget,targetToSource),issues(idReadable))))"
 
   @doc """
   The `fields` query parameter selecting everything `normalize/3` reads.
@@ -119,6 +141,11 @@ defmodule CymphonyElixir.YouTrack.Issue do
 
   @doc """
   Reads the named custom field's `value.name` from a decoded issue.
+
+  A *multi*-value field (`MultiVersionIssueCustomField` and friends) hands back
+  a list rather than one object; the first entry wins. Without that clause such
+  a field decodes to `nil`, which for the version marker would silently mean
+  "branch from the repository default" on every issue in the project.
   """
   @spec custom_field_name(map(), String.t()) :: String.t() | nil
   def custom_field_name(%{"customFields" => fields}, name) when is_list(fields) do
@@ -126,11 +153,45 @@ defmodule CymphonyElixir.YouTrack.Issue do
     |> Enum.find(&(is_map(&1) and &1["name"] == name))
     |> case do
       %{"value" => %{"name" => value}} when is_binary(value) -> value
+      %{"value" => [%{"name" => value} | _rest]} when is_binary(value) -> value
       _ -> nil
     end
   end
 
   def custom_field_name(_issue, _name), do: nil
+
+  @doc """
+  The custom field name holding the release version, from `opts`.
+  """
+  @spec version_field(keyword()) :: String.t()
+  def version_field(opts) when is_list(opts) do
+    case Keyword.get(opts, :version_field) do
+      value when is_binary(value) -> if String.trim(value) == "", do: @default_version_field, else: value
+      _ -> @default_version_field
+    end
+  end
+
+  @doc """
+  Every parent identifier a raw payload refers to: this issue's own, plus the
+  parent of each linked issue.
+
+  The client resolves these in one batch before normalizing, because deciding
+  whether an issue branches off its parent needs the *parent's* tags and an
+  issue payload never carries them.
+  """
+  @spec referenced_parent_ids(map()) :: [String.t()]
+  def referenced_parent_ids(%{} = issue) do
+    linked =
+      issue
+      |> Map.get("links", [])
+      |> List.wrap()
+      |> Enum.flat_map(&linked_issues/1)
+      |> Enum.flat_map(&List.wrap(parent_identifier(&1)))
+
+    Enum.uniq(List.wrap(parent_identifier(issue)) ++ linked)
+  end
+
+  def referenced_parent_ids(_issue), do: []
 
   @doc """
   Maps a YouTrack Priority enum name onto Linear's 1..4 integer rank.
@@ -152,6 +213,8 @@ defmodule CymphonyElixir.YouTrack.Issue do
     assignee = Keyword.get(opts, :assignee)
     state_field = state_field(opts)
     assignee_login = custom_field_login(issue, @assignee_field)
+    parent = parent_identifier(issue)
+    version = custom_field_name(issue, version_field(opts))
 
     %Issue{
       id: readable,
@@ -163,7 +226,10 @@ defmodule CymphonyElixir.YouTrack.Issue do
       branch_name: nil,
       url: issue_url(base_url, readable),
       assignee_id: assignee_login,
-      blocked_by: blockers(issue, state_field),
+      parent_identifier: parent,
+      version: version,
+      branch_from_parent: branch_from_parent?(parent, version, opts),
+      blocked_by: blockers(issue, state_field, opts),
       labels: labels(issue),
       assigned_to_worker: assigned_to_worker?(assignee_login, assignee),
       created_at: timestamp(issue["created"]),
@@ -193,37 +259,98 @@ defmodule CymphonyElixir.YouTrack.Issue do
 
   defp labels(_issue), do: []
 
-  defp blockers(%{"links" => links}, state_field) when is_list(links) do
-    Enum.flat_map(links, &link_blockers(&1, state_field))
+  # YouTrack models the parent/child relation as a link like any other, so the
+  # phrase read from *this* end tells us which side we are on. Only the first
+  # match is used: an issue has at most one parent, and a payload claiming more
+  # is a data error we do not want to silently average out.
+  defp parent_identifier(%{"links" => links}) when is_list(links) do
+    Enum.find_value(links, fn link ->
+      if link_phrase?(link, @parent_phrases), do: first_linked_identifier(link)
+    end)
   end
 
-  defp blockers(_issue, _state_field), do: []
+  defp parent_identifier(_issue), do: nil
 
-  defp link_blockers(%{"issues" => issues} = link, state_field) when is_list(issues) do
+  defp first_linked_identifier(%{"issues" => [%{} = issue | _]}), do: issue["idReadable"] || issue["id"]
+  defp first_linked_identifier(_link), do: nil
+
+  defp linked_issues(%{"issues" => issues}) when is_list(issues), do: Enum.filter(issues, &is_map/1)
+  defp linked_issues(_link), do: []
+
+  defp blockers(%{"links" => links}, state_field, opts) when is_list(links) do
+    Enum.flat_map(links, &link_blockers(&1, state_field, opts))
+  end
+
+  defp blockers(_issue, _state_field, _opts), do: []
+
+  defp link_blockers(%{"issues" => issues} = link, state_field, opts) when is_list(issues) do
     if blocking_link?(link) do
-      Enum.flat_map(issues, &blocker_entry(&1, state_field))
+      Enum.flat_map(issues, &blocker_entry(&1, state_field, opts))
     else
       []
     end
   end
 
-  defp link_blockers(_link, _state_field), do: []
+  defp link_blockers(_link, _state_field, _opts), do: []
 
-  defp blocker_entry(%{} = issue, state_field) do
+  # A blocker carries its own parent and branching policy, read from the nested
+  # `links` selection, so the gate can ask whether it landed on *its* base.
+  defp blocker_entry(%{} = issue, state_field, opts) do
+    parent = parent_identifier(issue)
+
     [
       %{
         id: issue["idReadable"] || issue["id"],
         identifier: issue["idReadable"],
-        state: custom_field_name(issue, state_field)
+        state: custom_field_name(issue, state_field),
+        parent_identifier: parent,
+        branch_from_parent: branch_from_parent?(parent, custom_field_name(issue, version_field(opts)), opts)
       }
     ]
   end
 
-  defp blocker_entry(_issue, _state_field), do: []
+  defp blocker_entry(_issue, _state_field, _opts), do: []
+
+  # "Tag implies it": a sub-task branches off its direct parent whenever that
+  # parent is a feature-branch container. The version marker is a second,
+  # explicit opt-in for a parent that carries no such tag — needed because in
+  # practice operators tag the epic and leave the field unset on most children.
+  #
+  # `:feature_branch_parents` is resolved by the client in one batched request
+  # before normalizing, because an issue payload never carries its parent's
+  # tags. An unresolvable parent is simply absent from the set, so the answer
+  # degrades to the configured base branch rather than to a guess.
+  defp branch_from_parent?(nil, _version, _opts), do: false
+
+  defp branch_from_parent?(parent, version, opts) do
+    feature_branch_parent?(parent, opts) or merge_to_parent_version?(version, opts)
+  end
+
+  defp feature_branch_parent?(parent, opts) do
+    case Keyword.get(opts, :feature_branch_parents) do
+      parents when is_list(parents) -> Query.normalize_state(parent) in parents
+      _ -> false
+    end
+  end
+
+  defp merge_to_parent_version?(version, opts) when is_binary(version) do
+    case Keyword.get(opts, :merge_to_parent_version) do
+      marker when is_binary(marker) ->
+        normalized = Query.normalize_state(marker)
+        normalized != nil and normalized == Query.normalize_state(version)
+
+      _ ->
+        false
+    end
+  end
+
+  defp merge_to_parent_version?(_version, _opts), do: false
 
   # A YouTrack link is stored once and read from both ends: the phrase that
   # applies to *this* issue depends on which end it sits on.
-  defp blocking_link?(%{"direction" => direction, "linkType" => %{} = type}) do
+  defp blocking_link?(link), do: link_phrase?(link, @blocking_phrases)
+
+  defp link_phrase?(%{"direction" => direction, "linkType" => %{} = type}, phrases) do
     phrase =
       case direction do
         "OUTWARD" -> type["sourceToTarget"]
@@ -231,10 +358,10 @@ defmodule CymphonyElixir.YouTrack.Issue do
         _ -> type["name"]
       end
 
-    Query.normalize_state(phrase) in @blocking_phrases
+    Query.normalize_state(phrase) in phrases
   end
 
-  defp blocking_link?(_link), do: false
+  defp link_phrase?(_link, _phrases), do: false
 
   defp assigned_to_worker?(_login, nil), do: true
 

@@ -29,6 +29,9 @@ defmodule CymphonyElixir.YouTrack.Adapter do
   @spec fetch_issue_states_by_ids([String.t()], term()) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids, config), do: client_module().fetch_issue_states_by_ids(issue_ids, config)
 
+  @spec fetch_descendant_ids(String.t(), term()) :: {:ok, [String.t()]} | {:error, term()}
+  def fetch_descendant_ids(root_id, config), do: client_module().fetch_descendant_ids(root_id, config)
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body), do: client_module().create_comment(issue_id, body)
 

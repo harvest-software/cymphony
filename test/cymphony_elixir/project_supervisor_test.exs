@@ -52,6 +52,69 @@ defmodule CymphonyElixir.ProjectSupervisorTest do
     assert length(children) == 2
   end
 
+  defp gate_opts(children) do
+    %{start: {CymphonyElixir.DependencyGate, :start_link, [opts]}} =
+      Enum.find(children, &match?(%{id: CymphonyElixir.DependencyGate}, &1))
+
+    opts
+  end
+
+  test "init/1 adds a dependency gate only when the project has a repository" do
+    tmp = Path.join(System.tmp_dir!(), "cymphony-gate-child-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(tmp)
+    Application.put_env(:cymphony_elixir, :config_dir_override, tmp)
+
+    on_exit(fn ->
+      Application.delete_env(:cymphony_elixir, :config_dir_override)
+      File.rm_rf!(tmp)
+    end)
+
+    name = "gated-#{System.unique_integer([:positive])}"
+    other = "ungated-#{System.unique_integer([:positive])}"
+
+    :ok =
+      CymphonyConfig.save(%{
+        "projects" => [
+          %{"name" => name, "repo_url" => "git@example.com:group/repo.git"},
+          %{"name" => other}
+        ]
+      })
+
+    assert {:ok, {_flags, children}} = ProjectSupervisor.init(project_name: name, workflow_path: "/tmp/WORKFLOW.md")
+    assert length(children) == 3
+
+    # The mirror is cloned over HTTPS for the same reason the workspace is.
+    assert gate_opts(children) |> Keyword.fetch!(:repo_url) == "https://example.com/group/repo.git"
+
+    # There is nothing to check ancestry against without a repository, and a
+    # missing gate degrades to the tracker-state behaviour everywhere.
+    assert {:ok, {_flags, plain}} = ProjectSupervisor.init(project_name: other, workflow_path: "/tmp/WORKFLOW.md")
+    assert length(plain) == 2
+  end
+
+  test "init/1 keeps an SSH remote for the mirror when rewrite_ssh_remote is false" do
+    tmp = Path.join(System.tmp_dir!(), "cymphony-gate-ssh-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(tmp)
+    Application.put_env(:cymphony_elixir, :config_dir_override, tmp)
+
+    on_exit(fn ->
+      Application.delete_env(:cymphony_elixir, :config_dir_override)
+      File.rm_rf!(tmp)
+    end)
+
+    name = "gated-ssh-#{System.unique_integer([:positive])}"
+
+    :ok =
+      CymphonyConfig.save(%{
+        "projects" => [
+          %{"name" => name, "repo_url" => "git@example.com:group/repo.git", "rewrite_ssh_remote" => false}
+        ]
+      })
+
+    assert {:ok, {_flags, children}} = ProjectSupervisor.init(project_name: name, workflow_path: "/tmp/WORKFLOW.md")
+    assert gate_opts(children) |> Keyword.fetch!(:repo_url) == "git@example.com:group/repo.git"
+  end
+
   test "start_link/1 fails when the workflow file is missing" do
     name = "missing-wf-#{System.unique_integer([:positive])}"
     missing = Path.join(System.tmp_dir!(), "cymphony-ps-missing-#{System.unique_integer([:positive])}.md")

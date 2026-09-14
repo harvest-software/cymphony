@@ -70,7 +70,7 @@ defmodule CymphonyElixir.YouTrack.IssueTest do
         ])
 
       assert Issue.normalize(linked, @base, state_field: "Stage").blocked_by == [
-               %{id: "HC-2", identifier: "HC-2", state: "Done"}
+               %{id: "HC-2", identifier: "HC-2", state: "Done", parent_identifier: nil, branch_from_parent: false}
              ]
     end
 
@@ -185,6 +185,161 @@ defmodule CymphonyElixir.YouTrack.IssueTest do
     end
   end
 
+  describe "branching off the parent" do
+    @subtask_link %{"name" => "Subtask", "sourceToTarget" => "parent for", "targetToSource" => "subtask of"}
+
+    defp child(overrides \\ %{}) do
+      raw(
+        Map.merge(
+          %{
+            "idReadable" => "HFE-6471",
+            "links" => [
+              %{
+                "direction" => "INWARD",
+                "linkType" => @subtask_link,
+                "issues" => [%{"idReadable" => "HFE-6470", "customFields" => []}]
+              }
+            ]
+          },
+          overrides
+        )
+      )
+    end
+
+    defp version(name) do
+      %{
+        "customFields" => [
+          %{"name" => "State", "value" => %{"name" => "Open"}},
+          %{"name" => "Version", "value" => %{"name" => name}}
+        ]
+      }
+    end
+
+    test "a container-tagged parent opts every child in" do
+      # The operating rule: tag the epic once, and all eighteen sub-tasks cut
+      # from its branch without touching a field on any of them.
+      parents = ["hfe-6470"]
+
+      assert Issue.normalize(child(), @base, feature_branch_parents: parents).branch_from_parent
+      refute Issue.normalize(child(), @base, feature_branch_parents: []).branch_from_parent
+      refute Issue.normalize(child(), @base).branch_from_parent
+    end
+
+    test "the version marker opts a single child in without a tagged parent" do
+      opts = [merge_to_parent_version: "Merge to Parent Feature Branch"]
+
+      assert Issue.normalize(child(version("Merge to Parent Feature Branch")), @base, opts).branch_from_parent
+      refute Issue.normalize(child(version("2026.1")), @base, opts).branch_from_parent
+      # Without the marker configured, the field means nothing.
+      refute Issue.normalize(child(version("Merge to Parent Feature Branch")), @base).branch_from_parent
+    end
+
+    test "the marker match is case- and whitespace-insensitive" do
+      opts = [merge_to_parent_version: "  merge TO parent feature branch "]
+      assert Issue.normalize(child(version("Merge to Parent Feature Branch")), @base, opts).branch_from_parent
+    end
+
+    test "an issue with no parent never branches off one" do
+      parents = ["hfe-6470"]
+      opts = [feature_branch_parents: parents, merge_to_parent_version: "Merge to Parent Feature Branch"]
+
+      orphan = raw(version("Merge to Parent Feature Branch"))
+
+      refute Issue.normalize(orphan, @base, opts).branch_from_parent
+      assert Issue.normalize(orphan, @base, opts).parent_identifier == nil
+    end
+
+    test "the version field name is configurable and reads a multi-value field" do
+      # A renamed field that decodes to nil would silently send every issue in
+      # the project to the repository default, which is the `state_field`
+      # failure all over again.
+      multi = %{
+        "customFields" => [
+          %{"name" => "Fix versions", "value" => [%{"name" => "Merge to Parent Feature Branch"}, %{"name" => "2026.1"}]}
+        ]
+      }
+
+      opts = [version_field: "Fix versions", merge_to_parent_version: "Merge to Parent Feature Branch"]
+
+      assert Issue.normalize(child(multi), @base, opts).version == "Merge to Parent Feature Branch"
+      assert Issue.normalize(child(multi), @base, opts).branch_from_parent
+      # Reading the default name finds nothing, and the issue quietly opts out.
+      refute Issue.normalize(child(multi), @base, merge_to_parent_version: "Merge to Parent Feature Branch").branch_from_parent
+    end
+
+    test "version_field/1 falls back to Version" do
+      assert Issue.version_field([]) == "Version"
+      assert Issue.version_field(version_field: "  ") == "Version"
+      assert Issue.version_field(version_field: 7) == "Version"
+      assert Issue.version_field(version_field: "Fix versions") == "Fix versions"
+    end
+
+    test "a blocker carries its own parent and policy" do
+      # The gate asks where the dependency was supposed to land, so each entry
+      # needs the dependency's own parent — read from the nested link selection.
+      dependency = %{
+        "idReadable" => "HFE-6472",
+        "customFields" => [%{"name" => "State", "value" => %{"name" => "Done"}}],
+        "links" => [
+          %{
+            "direction" => "INWARD",
+            "linkType" => @subtask_link,
+            "issues" => [%{"idReadable" => "HFE-6470"}]
+          }
+        ]
+      }
+
+      depends = %{"name" => "Depends", "sourceToTarget" => "is required for", "targetToSource" => "depends on"}
+      linked = raw(%{"links" => [%{"direction" => "INWARD", "linkType" => depends, "issues" => [dependency]}]})
+
+      assert Issue.normalize(linked, @base, feature_branch_parents: ["hfe-6470"]).blocked_by == [
+               %{
+                 id: "HFE-6472",
+                 identifier: "HFE-6472",
+                 state: "Done",
+                 parent_identifier: "HFE-6470",
+                 branch_from_parent: true
+               }
+             ]
+    end
+
+    test "referenced_parent_ids/1 collects this issue's parent and each dependency's" do
+      # One batched tag lookup per poll needs the whole set up front.
+      dependency = %{
+        "idReadable" => "HFE-6472",
+        "links" => [
+          %{"direction" => "INWARD", "linkType" => @subtask_link, "issues" => [%{"idReadable" => "HFE-6489"}]}
+        ]
+      }
+
+      depends = %{"name" => "Depends", "sourceToTarget" => "is required for", "targetToSource" => "depends on"}
+
+      payload =
+        child(%{
+          "links" => [
+            %{
+              "direction" => "INWARD",
+              "linkType" => @subtask_link,
+              "issues" => [%{"idReadable" => "HFE-6470", "customFields" => []}]
+            },
+            %{"direction" => "INWARD", "linkType" => depends, "issues" => [dependency]}
+          ]
+        })
+
+      assert Enum.sort(Issue.referenced_parent_ids(payload)) == ["HFE-6470", "HFE-6489"]
+      assert Issue.referenced_parent_ids(%{}) == []
+      assert Issue.referenced_parent_ids("nonsense") == []
+      # A link with no `issues` array at all contributes nothing.
+      assert Issue.referenced_parent_ids(%{"links" => [%{"direction" => "INWARD"}, "junk"]}) == []
+    end
+
+    test "fields/0 nests the linked issues' own parent links" do
+      # Without the second level a blocker has no parent, and the gate silently
+      # falls back to the dependent's base on every dependency.
+      assert Issue.fields() =~ "issues(id,idReadable,customFields(name,value(name)),links("
+    end
+  end
+
   describe "blockers" do
     defp link(direction, type, issues) do
       raw(%{"links" => [%{"direction" => direction, "linkType" => type, "issues" => issues}]})
@@ -197,7 +352,7 @@ defmodule CymphonyElixir.YouTrack.IssueTest do
       blocker = [%{"idReadable" => "LLM-7", "customFields" => [%{"name" => "State", "value" => %{"name" => "Todo"}}]}]
 
       assert Issue.normalize(link("INWARD", @depends, blocker), @base).blocked_by == [
-               %{id: "LLM-7", identifier: "LLM-7", state: "Todo"}
+               %{id: "LLM-7", identifier: "LLM-7", state: "Todo", parent_identifier: nil, branch_from_parent: false}
              ]
 
       assert Issue.normalize(link("OUTWARD", @depends, blocker), @base).blocked_by == []
@@ -214,7 +369,7 @@ defmodule CymphonyElixir.YouTrack.IssueTest do
       type = %{"name" => "Blocked by", "sourceToTarget" => "x", "targetToSource" => "y"}
 
       assert Issue.normalize(link("BOTH", type, blocker), @base).blocked_by == [
-               %{id: "2-9", identifier: nil, state: nil}
+               %{id: "2-9", identifier: nil, state: nil, parent_identifier: nil, branch_from_parent: false}
              ]
     end
 
@@ -232,6 +387,49 @@ defmodule CymphonyElixir.YouTrack.IssueTest do
 
       assert Issue.normalize(malformed, @base).blocked_by == []
       assert Issue.normalize(raw(%{"links" => "nope"}), @base).blocked_by == []
+    end
+  end
+
+  describe "parent_identifier" do
+    test "reads the parent from the child end of the Subtask link" do
+      # A sub-task branches off its parent's branch, so the parent has to be
+      # carried on the struct; it still contributes no blocker.
+      parent = [%{"idReadable" => "HFE-6470", "customFields" => []}]
+      issue = Issue.normalize(link("INWARD", @subtask, parent), @base)
+
+      assert issue.parent_identifier == "HFE-6470"
+      assert issue.blocked_by == []
+    end
+
+    test "an epic reading its own links is not a subtask of its first child" do
+      # YouTrack stores the link once: the parent end reads "parent for", and
+      # treating that as a parent marker would make every epic a child of its
+      # own sub-task and send it branching off a branch that does not exist.
+      children = [%{"idReadable" => "HFE-6471", "customFields" => []}]
+
+      assert Issue.normalize(link("OUTWARD", @subtask, children), @base).parent_identifier == nil
+    end
+
+    test "a depends-on link is not a parent" do
+      blocker = [%{"idReadable" => "LLM-7", "customFields" => []}]
+
+      assert Issue.normalize(link("INWARD", @depends, blocker), @base).parent_identifier == nil
+    end
+
+    test "an issue with no links has no parent" do
+      assert Issue.normalize(raw(), @base).parent_identifier == nil
+      assert Issue.normalize(raw(%{"links" => "nope"}), @base).parent_identifier == nil
+    end
+
+    test "a parent link carrying no issue is not a parent" do
+      assert Issue.normalize(link("INWARD", @subtask, []), @base).parent_identifier == nil
+      assert Issue.normalize(link("INWARD", @subtask, ["not a map"]), @base).parent_identifier == nil
+    end
+
+    test "falls back to the internal id when the parent has no readable id" do
+      parent = [%{"id" => "2-9", "customFields" => []}]
+
+      assert Issue.normalize(link("INWARD", @subtask, parent), @base).parent_identifier == "2-9"
     end
   end
 end

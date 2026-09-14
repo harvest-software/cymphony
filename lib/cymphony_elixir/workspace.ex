@@ -4,7 +4,7 @@ defmodule CymphonyElixir.Workspace do
   """
 
   require Logger
-  alias CymphonyElixir.{Config, PathSafety, SSH}
+  alias CymphonyElixir.{Config, PathSafety, PromptBuilder, SSH}
 
   @remote_workspace_marker "__CYMPHONY_WORKSPACE__"
   # Must match CymphonyElixir.Agent.Antigravity's @session_log_prefix.
@@ -15,8 +15,8 @@ defmodule CymphonyElixir.Workspace do
   @spec create_for_issue(map() | String.t() | nil, worker_host(), keyword()) ::
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil, opts \\ []) do
-    issue_context = issue_context(issue_or_identifier)
     config = Keyword.get(opts, :config)
+    issue_context = issue_context(issue_or_identifier, config)
 
     try do
       safe_id = safe_identifier(issue_context.issue_identifier)
@@ -294,8 +294,8 @@ defmodule CymphonyElixir.Workspace do
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) ::
           :ok | {:error, term()}
   def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ []) when is_binary(workspace) do
-    issue_context = issue_context(issue_or_identifier)
     config = Keyword.get(opts, :config)
+    issue_context = issue_context(issue_or_identifier, config)
     hooks = hooks_config(config)
 
     case hooks.before_run do
@@ -309,8 +309,8 @@ defmodule CymphonyElixir.Workspace do
 
   @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) :: :ok
   def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ []) when is_binary(workspace) do
-    issue_context = issue_context(issue_or_identifier)
     config = Keyword.get(opts, :config)
+    issue_context = issue_context(issue_or_identifier, config)
     hooks = hooks_config(config)
 
     case hooks.after_run do
@@ -459,9 +459,11 @@ defmodule CymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
+    env = hook_env(issue_context)
+
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true, env: env)
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -482,7 +484,13 @@ defmodule CymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    remote_command =
+      issue_context
+      |> hook_env()
+      |> Enum.map_join("", fn {name, value} -> "export #{name}=#{shell_escape(value)}\n" end)
+      |> Kernel.<>("cd #{shell_escape(workspace)} && #{command}")
+
+    case run_remote_command(worker_host, remote_command, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -623,26 +631,58 @@ defmodule CymphonyElixir.Workspace do
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue, config) do
     %{
       issue_id: issue_id,
-      issue_identifier: identifier || "issue"
+      issue_identifier: identifier || "issue",
+      base_branch: PromptBuilder.base_branch(issue, config),
+      branch_name: branch_name_for(issue, config)
     }
   end
 
-  defp issue_context(identifier) when is_binary(identifier) do
+  defp issue_context(identifier, _config) when is_binary(identifier) do
     %{
       issue_id: nil,
-      issue_identifier: identifier
+      issue_identifier: identifier,
+      base_branch: nil,
+      branch_name: nil
     }
   end
 
-  defp issue_context(_identifier) do
+  defp issue_context(_identifier, _config) do
     %{
       issue_id: nil,
-      issue_identifier: "issue"
+      issue_identifier: "issue",
+      base_branch: nil,
+      branch_name: nil
     }
   end
+
+  defp branch_name_for(issue, config) do
+    template =
+      case config do
+        %{branch_name_template: value} when is_binary(value) and value != "" -> value
+        _ -> "{{ issue.identifier }}"
+      end
+
+    PromptBuilder.branch_name(issue, template)
+  end
+
+  # Hooks are the only place Cymphony's own git commands run, and the clone has
+  # to know which branch to check out — but the hook command is generated once
+  # per project while the base branch is per issue, so it is exported rather
+  # than interpolated. An identifier-only context (a stale-workspace sweep, a
+  # removal) has no issue to derive them from and exports nothing.
+  defp hook_env(%{base_branch: base, branch_name: branch, issue_identifier: identifier})
+       when is_binary(base) and is_binary(branch) do
+    [
+      {"CYMPHONY_BASE_BRANCH", base},
+      {"CYMPHONY_BRANCH_NAME", branch},
+      {"CYMPHONY_ISSUE", identifier || ""}
+    ]
+  end
+
+  defp hook_env(_issue_context), do: []
 
   defp issue_log_context(%{issue_id: issue_id, issue_identifier: issue_identifier}) do
     "issue_id=#{issue_id || "n/a"} issue_identifier=#{issue_identifier || "issue"}"

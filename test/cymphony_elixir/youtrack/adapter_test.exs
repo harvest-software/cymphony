@@ -12,6 +12,7 @@ defmodule CymphonyElixir.YouTrack.AdapterTest do
     def fetch_issues_by_states(states, config), do: record({:fetch_issues_by_states, states, config})
     def fetch_issue_states_by_ids(ids), do: record({:fetch_issue_states_by_ids, ids})
     def fetch_issue_states_by_ids(ids, config), do: record({:fetch_issue_states_by_ids, ids, config})
+    def fetch_descendant_ids(root, config), do: record({:fetch_descendant_ids, root, config})
     def create_comment(id, body), do: record({:create_comment, id, body})
     def create_comment(id, body, config), do: record({:create_comment, id, body, config})
     def update_issue_state(id, state), do: record({:update_issue_state, id, state})
@@ -48,6 +49,7 @@ defmodule CymphonyElixir.YouTrack.AdapterTest do
     assert {:ok, _} = Adapter.fetch_issues_by_states(["Todo"], config)
     assert {:ok, _} = Adapter.fetch_issue_states_by_ids(["LLM-1"])
     assert {:ok, _} = Adapter.fetch_issue_states_by_ids(["LLM-1"], config)
+    assert {:ok, _} = Adapter.fetch_descendant_ids("HFE-6470", config)
     assert {:ok, _} = Adapter.create_comment("LLM-1", "hi")
     assert {:ok, _} = Adapter.create_comment("LLM-1", "hi", config)
     assert {:ok, _} = Adapter.update_issue_state("LLM-1", "Done")
@@ -57,6 +59,7 @@ defmodule CymphonyElixir.YouTrack.AdapterTest do
     assert_received {:fetch_candidate_issues, ^config}
     assert_received {:fetch_issues_by_states, ["Todo"]}
     assert_received {:fetch_issues_by_states, ["Todo"], ^config}
+    assert_received {:fetch_descendant_ids, "HFE-6470", ^config}
     assert_received {:fetch_issue_states_by_ids, ["LLM-1"]}
     assert_received {:fetch_issue_states_by_ids, ["LLM-1"], ^config}
     assert_received {:create_comment, "LLM-1", "hi"}

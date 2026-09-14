@@ -25,7 +25,7 @@ defmodule CymphonyElixir.Config do
   - A Linear comment alone is not the trigger. When a human moves an issue from Human Review back to In Progress, treat new human comments as the work request.
   - If an attached PR already exists, read issue comments and PR comments before changing code.
   - Ignore agent workpad/progress comments and maintain this workpad checkpoint: Last processed human comment: <comment id or timestamp>
-  - For merge-conflict requests, update the existing PR branch with latest origin/main, resolve conflicts, rerun validation, push, and move back to Human Review only after checks are green.
+  - For merge-conflict requests, update the existing PR branch with latest origin/{{ base_branch }}, resolve conflicts, rerun validation, push, and move back to Human Review only after checks are green.
   """
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}

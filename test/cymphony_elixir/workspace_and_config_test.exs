@@ -370,7 +370,7 @@ defmodule CymphonyElixir.WorkspaceAndConfigTest do
 
     issue = Client.normalize_issue_for_test(raw_issue, "user-1")
 
-    assert issue.blocked_by == [%{id: "issue-2", identifier: "MT-2", state: "In Progress"}]
+    assert issue.blocked_by == [%{id: "issue-2", identifier: "MT-2", state: "In Progress", parent_identifier: nil, branch_from_parent: false}]
     assert issue.labels == ["backend"]
     assert issue.priority == 2
     assert issue.state == "Todo"
@@ -620,7 +620,7 @@ defmodule CymphonyElixir.WorkspaceAndConfigTest do
       identifier: "MT-1005",
       title: "Stale blocked work",
       state: "Todo",
-      blocked_by: [%{id: "blocker-3", identifier: "MT-1006", state: "In Progress"}]
+      blocked_by: [%{id: "blocker-3", identifier: "MT-1006", state: "In Progress", parent_identifier: nil, branch_from_parent: false}]
     }
 
     fetcher = fn ["blocked-2"] -> {:ok, [refreshed_issue]} end
@@ -629,7 +629,16 @@ defmodule CymphonyElixir.WorkspaceAndConfigTest do
              Orchestrator.revalidate_issue_for_dispatch_for_test(stale_issue, fetcher)
 
     assert skipped_issue.identifier == "MT-1005"
-    assert skipped_issue.blocked_by == [%{id: "blocker-3", identifier: "MT-1006", state: "In Progress"}]
+
+    assert skipped_issue.blocked_by == [
+             %{
+               id: "blocker-3",
+               identifier: "MT-1006",
+               state: "In Progress",
+               parent_identifier: nil,
+               branch_from_parent: false
+             }
+           ]
   end
 
   test "workspace remove returns error information for missing directory" do

@@ -20,11 +20,18 @@ defmodule CymphonyElixir.YouTrack.Client do
 
   alias CymphonyElixir.Config
   alias CymphonyElixir.Linear.Issue, as: NormalizedIssue
+  alias CymphonyElixir.YouTrack.BranchPolicy
   alias CymphonyElixir.YouTrack.Issue
   alias CymphonyElixir.YouTrack.Query
+  alias CymphonyElixir.YouTrack.Scope
 
   @page_size 100
   @max_pages 50
+  # Depth cap for the `scope_issue` subtree walk. YouTrack permits a link graph
+  # with cycles, and a visited set already terminates those; this is the second
+  # belt, against a pathologically deep tree turning one poll into 100 requests.
+  @max_subtree_depth 10
+  @max_query_scope_ids 200
   @request_timeout_ms 30_000
   @max_error_body_log_bytes 1_000
 
@@ -67,6 +74,53 @@ defmodule CymphonyElixir.YouTrack.Client do
         with {:ok, tracker} <- tracker_settings(config) do
           fetch_each_issue(tracker, ids)
         end
+    end
+  end
+
+  @doc """
+  Every id in the subtree rooted at `root_id`: the root itself plus its
+  descendants, at any depth.
+
+  Walked breadth-first, one query per level, because an issue carries only its
+  *immediate* parent — and an intermediate ancestor may itself be in a
+  non-active state and so absent from the polled candidate set, which is why
+  the subtree cannot be reconstructed from that set alone.
+  """
+  @spec fetch_descendant_ids(String.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def fetch_descendant_ids(root_id), do: fetch_descendant_ids(root_id, Config.settings!())
+
+  @spec fetch_descendant_ids(String.t(), term()) :: {:ok, [String.t()]} | {:error, term()}
+  def fetch_descendant_ids(root_id, config) when is_binary(root_id) do
+    case String.trim(root_id) do
+      "" ->
+        {:ok, []}
+
+      root ->
+        with {:ok, tracker} <- tracker_settings(config) do
+          walk_subtree(tracker, [root], MapSet.new([root]), 0)
+        end
+    end
+  end
+
+  @doc """
+  The tag names of each id in `issue_ids`, keyed by `idReadable`.
+
+  One request for the whole set, requesting only `tags(name)`. Backs
+  `CymphonyElixir.YouTrack.BranchPolicy`, which needs a parent's tags to decide
+  whether its children branch off it, and cannot get them from the children's
+  own payloads.
+  """
+  @spec fetch_issue_labels([String.t()], term()) :: {:ok, %{optional(String.t()) => [String.t()]}} | {:error, term()}
+  def fetch_issue_labels(issue_ids, config) when is_list(issue_ids) do
+    ids = normalized_states(issue_ids)
+
+    if ids == [] do
+      {:ok, %{}}
+    else
+      with {:ok, tracker} <- tracker_settings(config),
+           {:ok, raw_issues} <- fetch_pages(tracker, Query.by_ids(ids), 0, [], "idReadable,tags(name)") do
+        {:ok, Map.new(raw_issues, &{&1["idReadable"], tag_names(&1)})}
+      end
     end
   end
 
@@ -170,19 +224,31 @@ defmodule CymphonyElixir.YouTrack.Client do
   defp tracker_of(%{tracker: tracker}), do: tracker
 
   defp normalize_opts(tracker, assignee) do
-    [assignee: assignee, state_field: state_field(tracker)]
+    [
+      assignee: assignee,
+      state_field: state_field(tracker),
+      version_field: Map.get(tracker, :version_field),
+      merge_to_parent_version: Map.get(tracker, :merge_to_parent_version)
+    ]
   end
 
   defp state_field(%{state_field: value}) when is_binary(value) and value != "", do: value
   defp state_field(_tracker), do: "State"
 
   defp fetch_states(tracker, state_names, assignee) do
+    with {:ok, scope_ids} <- Scope.issue_ids(%{tracker: tracker}) do
+      fetch_states(tracker, state_names, assignee, scope_ids)
+    end
+  end
+
+  defp fetch_states(tracker, state_names, assignee, scope_ids) do
     states = normalized_states(state_names)
     wanted = MapSet.new(Enum.map(states, &Query.normalize_state/1))
+    scope = scope_set(scope_ids)
 
-    case fetch_pages(tracker, Query.issues(tracker.project_slug, states), 0, []) do
+    case fetch_pages(tracker, Query.issues(tracker.project_slug, states, query_scope_ids(scope_ids)), 0, []) do
       {:ok, raw_issues} ->
-        {:ok, decode_issues(raw_issues, tracker, assignee, wanted)}
+        {:ok, decode_issues(raw_issues, tracker, assignee, wanted, scope)}
 
       # YouTrack rejects the *whole* search when a named value is not in the
       # field's bundle ("The value \"Confirmed\" isn't used for the Stage
@@ -198,8 +264,8 @@ defmodule CymphonyElixir.YouTrack.Client do
             "the #{state_field(tracker)} field (see the logged response body)."
         )
 
-        case fetch_pages(tracker, Query.issues(tracker.project_slug, []), 0, []) do
-          {:ok, raw_issues} -> {:ok, decode_issues(raw_issues, tracker, assignee, wanted)}
+        case fetch_pages(tracker, Query.issues(tracker.project_slug, [], query_scope_ids(scope_ids)), 0, []) do
+          {:ok, raw_issues} -> {:ok, decode_issues(raw_issues, tracker, assignee, wanted, scope)}
           {:error, reason} -> {:error, reason}
         end
 
@@ -208,15 +274,61 @@ defmodule CymphonyElixir.YouTrack.Client do
     end
   end
 
-  defp fetch_pages(_tracker, _query, page, acc) when page >= @max_pages do
+  defp walk_subtree(_tracker, [], visited, _depth), do: {:ok, MapSet.to_list(visited)}
+
+  defp walk_subtree(_tracker, _frontier, visited, depth) when depth >= @max_subtree_depth do
+    Logger.warning("YouTrack subtree walk stopped at the #{@max_subtree_depth}-level cap; deeper sub-tasks are out of scope")
+
+    {:ok, MapSet.to_list(visited)}
+  end
+
+  defp walk_subtree(tracker, frontier, visited, depth) do
+    case fetch_child_ids(tracker, frontier) do
+      {:ok, ids} ->
+        next = Enum.reject(ids, &MapSet.member?(visited, &1))
+        walk_subtree(tracker, next, MapSet.union(visited, MapSet.new(next)), depth + 1)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp fetch_child_ids(tracker, parent_ids) do
+    case Query.subtree(parent_ids) do
+      "" ->
+        {:ok, []}
+
+      query ->
+        case fetch_pages(tracker, query, 0, [], "idReadable") do
+          {:ok, raw_issues} -> {:ok, Enum.flat_map(raw_issues, &readable_id/1)}
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  defp readable_id(%{"idReadable" => id}) when is_binary(id) and id != "", do: [id]
+  defp readable_id(_issue), do: []
+
+  defp tag_names(%{"tags" => tags}) when is_list(tags) do
+    Enum.flat_map(tags, fn
+      %{"name" => name} when is_binary(name) -> [name]
+      _ -> []
+    end)
+  end
+
+  defp tag_names(_issue), do: []
+
+  defp fetch_pages(tracker, query, page, acc), do: fetch_pages(tracker, query, page, acc, Issue.fields())
+
+  defp fetch_pages(_tracker, _query, page, acc, _fields) when page >= @max_pages do
     Logger.warning("YouTrack poll stopped at the #{@max_pages}-page cap; narrow the project's active states")
     {:ok, acc}
   end
 
-  defp fetch_pages(tracker, query, page, acc) do
+  defp fetch_pages(tracker, query, page, acc, fields) do
     params = [
       query: query,
-      fields: Issue.fields(),
+      fields: fields,
       "$top": @page_size,
       "$skip": page * @page_size
     ]
@@ -228,7 +340,7 @@ defmodule CymphonyElixir.YouTrack.Client do
         if length(issues) < @page_size do
           {:ok, acc}
         else
-          fetch_pages(tracker, query, page + 1, acc)
+          fetch_pages(tracker, query, page + 1, acc, fields)
         end
 
       {:ok, _other} ->
@@ -248,7 +360,9 @@ defmodule CymphonyElixir.YouTrack.Client do
   end
 
   defp collect_issue({:ok, %{} = raw}, tracker, acc) do
-    case Issue.normalize(raw, instance_base(tracker.endpoint), normalize_opts(tracker, tracker.assignee)) do
+    opts = normalize_opts(tracker, tracker.assignee) ++ [feature_branch_parents: feature_branch_parents(tracker, [raw])]
+
+    case Issue.normalize(raw, instance_base(tracker.endpoint), opts) do
       nil -> {:cont, {:ok, acc}}
       issue -> {:cont, {:ok, acc ++ [issue]}}
     end
@@ -262,14 +376,41 @@ defmodule CymphonyElixir.YouTrack.Client do
   defp collect_issue({:error, {:youtrack_api_status, 404}}, _tracker, acc), do: {:cont, {:ok, acc}}
   defp collect_issue({:error, reason}, _tracker, _acc), do: {:halt, {:error, reason}}
 
-  defp decode_issues(raw_issues, tracker, assignee, wanted) do
+  defp decode_issues(raw_issues, tracker, assignee, wanted, scope) do
     base = instance_base(tracker.endpoint)
+    opts = normalize_opts(tracker, assignee) ++ [feature_branch_parents: feature_branch_parents(tracker, raw_issues)]
 
     raw_issues
-    |> Enum.map(&Issue.normalize(&1, base, normalize_opts(tracker, assignee)))
+    |> Enum.map(&Issue.normalize(&1, base, opts))
     |> Enum.reject(&is_nil/1)
-    |> Enum.filter(&wanted_state?(&1, wanted))
+    |> Enum.filter(&(wanted_state?(&1, wanted) and in_scope?(&1, scope)))
   end
+
+  # Whether an issue branches off its parent depends on the *parent's* tags,
+  # which no child payload carries. Seed the cache with what this batch already
+  # knows about itself — an epic in an active state is usually right here — and
+  # let `BranchPolicy` fetch only the remainder, once, for the whole page.
+  defp feature_branch_parents(tracker, raw_issues) do
+    config = %{tracker: tracker}
+
+    BranchPolicy.seed(config, Map.new(raw_issues, &{&1["idReadable"], tag_names(&1)}))
+    BranchPolicy.feature_branch_parents(config, Enum.flat_map(raw_issues, &Issue.referenced_parent_ids/1))
+  end
+
+  # `nil` is "unscoped", never "nothing in scope" — the two must not collapse,
+  # or a project with no `scope_issue` would poll nothing at all.
+  defp scope_set([]), do: nil
+  defp scope_set(ids) when is_list(ids), do: MapSet.new(ids)
+
+  defp in_scope?(_issue, nil), do: true
+  defp in_scope?(%{identifier: identifier}, scope), do: MapSet.member?(scope, identifier)
+
+  # The `issue id:` clause is a narrowing optimization, and a very large scope
+  # would make the query longer than the server will accept. Past the cap the
+  # clause is dropped and the local `in_scope?/2` filter — which is the actual
+  # correctness boundary — carries the whole load.
+  defp query_scope_ids(ids) when length(ids) > @max_query_scope_ids, do: []
+  defp query_scope_ids(ids), do: ids
 
   defp wanted_state?(issue, wanted) do
     MapSet.member?(wanted, Query.normalize_state(issue.state))

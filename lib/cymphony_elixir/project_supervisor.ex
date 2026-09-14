@@ -11,9 +11,9 @@ defmodule CymphonyElixir.ProjectSupervisor do
 
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
   alias CymphonyElixir.Cymphony.WorkflowGenerator
-  alias CymphonyElixir.{Orchestrator, WorkflowStore}
+  alias CymphonyElixir.{DependencyGate, Orchestrator, WorkflowStore}
 
-  @project_roles [:supervisor, :workflow_store, :orchestrator]
+  @project_roles [:supervisor, :workflow_store, :orchestrator, :dependency_gate]
   @unregister_poll_ms 5
   @unregister_budget_ms 1_000
 
@@ -34,12 +34,40 @@ defmodule CymphonyElixir.ProjectSupervisor do
     project_name = Keyword.fetch!(opts, :project_name)
     workflow_path = Keyword.fetch!(opts, :workflow_path)
 
-    children = [
-      {WorkflowStore, name: via_tuple(project_name, :workflow_store), workflow_path: workflow_path},
-      {Orchestrator, name: via_tuple(project_name, :orchestrator), project_name: project_name}
-    ]
+    children =
+      dependency_gate_child(project_name) ++
+        [
+          {WorkflowStore, name: via_tuple(project_name, :workflow_store), workflow_path: workflow_path},
+          {Orchestrator, name: via_tuple(project_name, :orchestrator), project_name: project_name}
+        ]
 
     Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  # Started before the Orchestrator so the first poll tick can already get a
+  # verdict, and only when there is a repository to mirror: without `repo_url`
+  # there is nothing to check ancestry against, and a project with no config
+  # entry at all is legacy WORKFLOW.md mode, where the gate simply does not
+  # apply. A missing gate answers `:unknown` everywhere, which is the
+  # pre-existing tracker-state behaviour.
+  defp dependency_gate_child(project_name) do
+    with {:ok, config} <- CymphonyConfig.load(),
+         {:ok, project} <- CymphonyConfig.find_project(config, project_name),
+         repo_url when repo_url != "" <- CymphonyConfig.repo_url(project) do
+      [
+        {DependencyGate, name: via_tuple(project_name, :dependency_gate), project_name: project_name, repo_url: clone_url(project, repo_url), forge: Map.get(project, "forge", "github")}
+      ]
+    else
+      _ -> []
+    end
+  end
+
+  defp clone_url(project, repo_url) do
+    if Map.get(project, "rewrite_ssh_remote") == false do
+      repo_url
+    else
+      CymphonyConfig.https_clone_url(repo_url)
+    end
   end
 
   @doc """

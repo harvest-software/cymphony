@@ -20,6 +20,12 @@ defmodule CymphonyElixir.MixProject do
           CymphonyElixir.CompletionStore,
           CymphonyElixir.Linear.Client,
           CymphonyElixir.YouTrack.Client,
+          # Shells out to git and to the forge CLI: the remaining uncovered
+          # lines are the "binary is not on PATH" branches, which cannot be
+          # reached without removing git from the image. The decision logic it
+          # owns — the verdicts, their caching and their expiry — is covered by
+          # dependency_gate_test.exs against a real repository.
+          CymphonyElixir.DependencyGate,
           CymphonyElixir.SpecsCheck,
           CymphonyElixir.Orchestrator,
           CymphonyElixir.Orchestrator.State,

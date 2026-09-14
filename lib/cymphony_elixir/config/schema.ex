@@ -166,6 +166,21 @@ defmodule CymphonyElixir.Config.Schema do
       field(:merge_state, :string, default: "Merging")
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
+      # Restricts polling to one issue and its descendants, at any depth. The
+      # root is included, so a leaf id scopes the run to that single issue.
+      # Blank (the default) polls the whole project.
+      field(:scope_issue, :string)
+      # Tag/label marking an issue as a *container* for a feature branch rather
+      # than work in its own right. Such an issue is never dispatched, and its
+      # children cut their branches from it instead of from `base_branch`.
+      # Blank disables both behaviours.
+      field(:feature_branch_label, :string, default: "Feature Branch")
+      # Custom field holding the release version, and the value of it that means
+      # "branch off my parent". A second, explicit opt-in for a child whose
+      # parent carries no container tag. YouTrack only; Linear has no
+      # equivalent field and leaves it unset.
+      field(:version_field, :string, default: "Version")
+      field(:merge_to_parent_version, :string, default: "Merge to Parent Feature Branch")
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -185,7 +200,11 @@ defmodule CymphonyElixir.Config.Schema do
           :review_state,
           :merge_state,
           :active_states,
-          :terminal_states
+          :terminal_states,
+          :scope_issue,
+          :feature_branch_label,
+          :version_field,
+          :merge_to_parent_version
         ],
         empty_values: []
       )
@@ -499,6 +518,12 @@ defmodule CymphonyElixir.Config.Schema do
     # rule the agent invents a name every run ("HC-1-hello-world-static-page"),
     # which is neither predictable nor greppable.
     field(:branch_name_template, :string, default: "{{ issue.identifier }}")
+    # Branch a run is cut from, and the branch its review targets, when the
+    # issue has no parent. An issue *with* a parent branches off the parent's
+    # branch instead — one level up only, so the chain composes as each parent
+    # does the same. The prompt renders this as `origin/{{ base_branch }}`,
+    # which used to be a hardcoded `origin/main` in six places.
+    field(:base_branch, :string, default: "main")
     # Forge credentials, so the agent can drive `glab`/`gh`. The tracker's
     # credential already lives in config; the forge's had been shell-env only,
     # which meant it silently vanished whenever the daemon was started from a
@@ -573,7 +598,7 @@ defmodule CymphonyElixir.Config.Schema do
 
   defp changeset(attrs) do
     %__MODULE__{}
-    |> cast(attrs, [:forge, :branch_name_template, :forge_token, :forge_host], empty_values: [])
+    |> cast(attrs, [:forge, :branch_name_template, :base_branch, :forge_token, :forge_host], empty_values: [])
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)

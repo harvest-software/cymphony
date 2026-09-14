@@ -15,7 +15,7 @@ defmodule CymphonyElixir.CLI do
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
   @background_start_timeout_ms 60_000
   @background_poll_interval_ms 200
-  @cymphony_mode_opt_keys [:project, :setup, :agent, :model, :effort, :provider, :concurrency]
+  @cymphony_mode_opt_keys [:project, :setup, :agent, :model, :effort, :provider, :concurrency, :issue]
   @switches [
     {@acknowledgement_switch, :boolean},
     agent: :string,
@@ -25,6 +25,7 @@ defmodule CymphonyElixir.CLI do
     daemon_internal: :boolean,
     effort: :string,
     help: :boolean,
+    issue: :string,
     logs_root: :string,
     model: :string,
     port: :integer,
@@ -170,6 +171,8 @@ defmodule CymphonyElixir.CLI do
   defp expand_shorthands(["model" | _]), do: ["--help"]
   defp expand_shorthands(["effort", value | rest]), do: ["--effort", value | expand_shorthands(rest)]
   defp expand_shorthands(["effort" | _]), do: ["--help"]
+  defp expand_shorthands(["issue", value | rest]), do: ["--issue", value | expand_shorthands(rest)]
+  defp expand_shorthands(["issue" | _]), do: ["--help"]
   defp expand_shorthands(["cr", value | rest]), do: ["--concurrency", value | expand_shorthands(rest)]
   defp expand_shorthands(["cr" | _]), do: ["--help"]
   defp expand_shorthands(["port", value | rest]), do: ["--port", value | expand_shorthands(rest)]
@@ -314,6 +317,7 @@ defmodule CymphonyElixir.CLI do
       cymphony effort high           Reasoning effort passed to the agent CLI
       cymphony c cz                  Run with a different provider (e.g. cz, ck, cm)
       cymphony c cv1,cz2,cz1         Run with provider rotation (random per session)
+      cymphony issue HFE-6470        Poll only that issue and its sub-tasks
       cymphony cr 3                  Set max concurrent agents to 3
       cymphony cr 3 c cv1,cz2        Set concurrency and provider rotation together
       cymphony port 4089             Set HTTP server / dashboard port
@@ -337,6 +341,7 @@ defmodule CymphonyElixir.CLI do
       --effort <level>         Reasoning effort passed to the agent CLI
       --provider <name>        Provider rotation (comma-separated auth aliases)
       --concurrency <n>        Set max concurrent agents
+      --issue <id>             Poll only that issue and its descendants
       --logs-root <path>       Override log directory
       --port <port>            Override HTTP server port
       --help, -h               Show this help
@@ -489,7 +494,20 @@ defmodule CymphonyElixir.CLI do
     |> apply_model_override(Keyword.get(opts, :model))
     |> apply_effort_override(Keyword.get(opts, :effort))
     |> apply_concurrency_override(Keyword.get(opts, :concurrency))
+    |> apply_scope_override(Keyword.get(opts, :issue))
   end
+
+  # Restricts polling to one issue and everything under it. Persisted like the
+  # other overrides, so the generated `WORKFLOW.md` carries
+  # `tracker.scope_issue` and the daemon keeps the scope across a reload.
+  defp apply_scope_override(projects, value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> projects
+      scope -> Enum.map(projects, &Map.put(&1, "scope_issue", scope))
+    end
+  end
+
+  defp apply_scope_override(projects, _value), do: projects
 
   defp apply_provider_override(projects, nil), do: projects
 

@@ -12,8 +12,10 @@ defmodule CymphonyElixir.Orchestrator do
     AgentRunner,
     CompletionStore,
     Config,
+    DependencyGate,
     HarnessStream,
     ProjectSupervisor,
+    PromptBuilder,
     RunSpecResolver,
     StatusDashboard,
     Tracker,
@@ -625,8 +627,8 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp waiting_eligible?(%Issue{} = issue, %State{} = state, active_states, terminal_states) do
-    candidate_issue?(issue, active_states, terminal_states) and
-      !queued_issue_blocked_by_non_terminal?(issue, queued_state_set(state), terminal_states) and
+    candidate_issue?(issue, active_states, terminal_states, state) and
+      !queued_issue_blocked_by_non_terminal?(issue, queued_state_set(state), terminal_states, state) and
       !MapSet.member?(state.claimed, issue.id) and
       !Map.has_key?(state.running, issue.id) and
       !Map.has_key?(state.retry_attempts, issue.id)
@@ -694,8 +696,8 @@ defmodule CymphonyElixir.Orchestrator do
          active_states,
          terminal_states
        ) do
-    candidate_issue?(issue, active_states, terminal_states) and
-      !queued_issue_blocked_by_non_terminal?(issue, queued_state_set(state), terminal_states) and
+    candidate_issue?(issue, active_states, terminal_states, state) and
+      !queued_issue_blocked_by_non_terminal?(issue, queued_state_set(state), terminal_states, state) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       available_slots(state) > 0 and
@@ -734,15 +736,51 @@ defmodule CymphonyElixir.Orchestrator do
            state: state_name
          } = issue,
          active_states,
-         terminal_states
+         terminal_states,
+         gate_state
        )
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     issue_routable_to_worker?(issue) and
       active_issue_state?(state_name, active_states) and
-      !terminal_issue_state?(state_name, terminal_states)
+      !terminal_issue_state?(state_name, terminal_states) and
+      !feature_branch_container?(issue, gate_state)
   end
 
-  defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
+  defp candidate_issue?(_issue, _active_states, _terminal_states, _gate_state), do: false
+
+  # An issue tagged `tracker.feature_branch_label` is a container for its
+  # children's work, not work itself: it holds the branch they merge into and
+  # has no change of its own to make. Dispatching an agent onto it would have it
+  # invent something to do on the branch every sub-task is about to cut from.
+  #
+  # It is dropped before reaching `waiting` rather than shown as permanently
+  # held: a board running several epics would otherwise read as a wall of
+  # blocked rows for tickets nobody ever intends to run. The debug line is what
+  # answers "why is HFE-6470 not running".
+  defp feature_branch_container?(%Issue{} = issue, %State{} = state) do
+    case container_label(state) do
+      nil ->
+        false
+
+      label ->
+        tagged? = Enum.any?(issue.labels || [], &(normalize_issue_state(&1) == label))
+
+        if tagged? do
+          Logger.debug("Skipping feature-branch container #{issue_context(issue)} (tagged #{inspect(label)})")
+        end
+
+        tagged?
+    end
+  end
+
+  defp feature_branch_container?(_issue, _state), do: false
+
+  defp container_label(%State{} = state) do
+    case state_config(state) do
+      %{tracker: %{feature_branch_label: value}} when is_binary(value) -> normalize_issue_state(value)
+      _ -> nil
+    end
+  end
 
   defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
        when is_boolean(assigned_to_worker),
@@ -764,22 +802,128 @@ defmodule CymphonyElixir.Orchestrator do
   #
   # Returns `true` when the issue should NOT be dispatched, `false` otherwise.
   defp queued_issue_blocked_by_non_terminal?(
-         %Issue{state: issue_state, blocked_by: blockers},
+         %Issue{state: issue_state, blocked_by: blockers} = issue,
          queued_states,
-         terminal_states
+         terminal_states,
+         gate_state
        )
        when is_binary(issue_state) and is_list(blockers) do
     queued_issue_state?(issue_state, queued_states) and
-      Enum.any?(blockers, fn
-        %{state: blocker_state} when is_binary(blocker_state) ->
-          !terminal_issue_state?(blocker_state, terminal_states)
-
-        _ ->
-          true
-      end)
+      blocking_reasons(issue, terminal_states, gate_state) != []
   end
 
-  defp queued_issue_blocked_by_non_terminal?(_issue, _queued_states, _terminal_states), do: false
+  defp queued_issue_blocked_by_non_terminal?(_issue, _queued_states, _terminal_states, _gate_state), do: false
+
+  # `{identifier, reason}` for every dependency currently holding `issue` back.
+  # The list doubles as the dispatch-skip log line: a bare count was
+  # undiagnosable on an epic with eighteen sub-tasks, because it never said
+  # *which* dependency, nor whether the hold was the ticket's state or its
+  # unmerged branch.
+  defp blocking_reasons(%Issue{blocked_by: blockers} = issue, terminal_states, gate_state)
+       when is_list(blockers) do
+    Enum.flat_map(blockers, fn blocker ->
+      case blocker_reason(blocker, issue, terminal_states, gate_state) do
+        nil -> []
+        reason -> [{blocker_identifier(blocker), reason}]
+      end
+    end)
+  end
+
+  defp blocking_reasons(_issue, _terminal_states, _gate_state), do: []
+
+  # A count told an operator nothing on an epic with eighteen sub-tasks. The
+  # summary names each dependency still holding the issue and why — its ticket
+  # state, or a branch that has not landed on the base.
+  defp blocking_summary(%Issue{} = issue, terminal_states, gate_state) do
+    case blocking_reasons(issue, terminal_states, gate_state) do
+      [] -> "none"
+      reasons -> Enum.map_join(reasons, ",", fn {identifier, reason} -> "#{identifier}(#{reason})" end)
+    end
+  end
+
+  defp blocker_identifier(%{identifier: identifier}) when is_binary(identifier), do: identifier
+  defp blocker_identifier(%{id: id}) when is_binary(id), do: id
+  defp blocker_identifier(_blocker), do: "unknown"
+
+  # Merge into the base branch is the stronger claim and wins outright, in both
+  # directions: a dependency whose branch has landed is not blocking even if
+  # its ticket is still open, and a dependency whose branch demonstrably has
+  # not landed keeps blocking even when its ticket says Fixed. Only when the
+  # gate cannot answer (no mirror, no such base ref, dependency branch absent,
+  # forge unreachable) does the tracker's state decide, which is exactly the
+  # behaviour that predates the gate.
+  defp blocker_reason(blocker, %Issue{} = issue, terminal_states, gate_state) do
+    case dependency_verdict(blocker, issue, gate_state) do
+      :merged -> nil
+      :blocked -> "unmerged"
+      :pending -> "checking"
+      :unknown -> state_reason(blocker, terminal_states)
+    end
+  end
+
+  defp state_reason(%{state: blocker_state}, terminal_states) when is_binary(blocker_state) do
+    if terminal_issue_state?(blocker_state, terminal_states), do: nil, else: "state=" <> blocker_state
+  end
+
+  # A blocker whose state could not be read fails closed: it is far better to
+  # wait for a human than to build on a dependency nobody can account for.
+  defp state_reason(_blocker, _terminal_states), do: "state=unknown"
+
+  defp dependency_verdict(blocker, %Issue{} = issue, %State{} = state) do
+    with gate when is_pid(gate) <- dependency_gate(state),
+         dep when is_binary(dep) <- dependency_branch(blocker, state),
+         base when is_binary(base) <- dependency_base_branch(blocker, issue, state) do
+      DependencyGate.merged?(gate, dep, base)
+    else
+      _ -> :unknown
+    end
+  end
+
+  defp dependency_verdict(_blocker, _issue, _gate_state), do: :unknown
+
+  defp dependency_gate(%State{project_name: project_name}) when is_binary(project_name),
+    do: ProjectSupervisor.lookup(project_name, :dependency_gate)
+
+  defp dependency_gate(_state), do: nil
+
+  defp dependency_branch(blocker, %State{} = state) do
+    case blocker_identifier(blocker) do
+      "unknown" ->
+        nil
+
+      identifier ->
+        nonblank_branch(PromptBuilder.branch_name(PromptBuilder.issue_for(identifier), branch_template(state)))
+    end
+  end
+
+  defp base_branch_for(%Issue{} = issue, %State{} = state) do
+    nonblank_branch(PromptBuilder.base_branch(issue, state_config(state)))
+  end
+
+  # Ask where the *dependency* was supposed to land, not whether it happens to
+  # be on the branch this issue is cutting from. A sub-task that merged into an
+  # epic branch would otherwise block a sibling branching off the repository
+  # default for good. A tracker that supplies no policy for the entry falls back
+  # to the dependent's base, which is the behaviour that predates this.
+  defp dependency_base_branch(blocker, %Issue{} = issue, %State{} = state) do
+    case PromptBuilder.blocker_base_branch(blocker, state_config(state)) do
+      branch when is_binary(branch) -> nonblank_branch(branch)
+      _ -> base_branch_for(issue, state)
+    end
+  end
+
+  defp branch_template(%State{} = state) do
+    case state_config(state) do
+      %{branch_name_template: template} when is_binary(template) and template != "" -> template
+      _ -> "{{ issue.identifier }}"
+    end
+  end
+
+  # `PromptBuilder` always returns a binary, falling back to the identifier
+  # when a template misbehaves — but it can still hand back `""` for an issue
+  # with no identifier at all, and `refs/heads/` is not a branch.
+  defp nonblank_branch(""), do: nil
+  defp nonblank_branch(branch) when is_binary(branch), do: branch
 
   defp queued_issue_state?(state_name, queued_states) when is_binary(state_name) do
     MapSet.member?(queued_states, normalize_issue_state(state_name))
@@ -890,7 +1034,7 @@ defmodule CymphonyElixir.Orchestrator do
   defp do_transition_to_in_progress(_issue, _queued_states, _in_progress_state, _update_fun), do: :ok
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil, opts \\ []) do
-    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids(&1, state.config), terminal_state_set(state)) do
+    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids(&1, state.config), terminal_state_set(state), state) do
       {:ok, %Issue{} = refreshed_issue} ->
         transition_to_in_progress(refreshed_issue, state)
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, opts)
@@ -900,7 +1044,9 @@ defmodule CymphonyElixir.Orchestrator do
         state
 
       {:skip, %Issue{} = refreshed_issue} ->
-        Logger.info("Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}")
+        Logger.info(
+          "Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{blocking_summary(refreshed_issue, terminal_state_set(state), state)}"
+        )
 
         state
 
@@ -1088,11 +1234,14 @@ defmodule CymphonyElixir.Orchestrator do
     })
   end
 
-  defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
+  defp revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_states),
+    do: revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_states, nil)
+
+  defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states, gate_state)
        when is_binary(issue_id) and is_function(issue_fetcher, 1) do
     case issue_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if retry_candidate_issue?(refreshed_issue, terminal_states) do
+        if retry_candidate_issue?(refreshed_issue, terminal_states, gate_state) do
           {:ok, refreshed_issue}
         else
           {:skip, refreshed_issue}
@@ -1106,7 +1255,7 @@ defmodule CymphonyElixir.Orchestrator do
     end
   end
 
-  defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
+  defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states, _gate_state), do: {:ok, issue}
 
   defp complete_issue(%State{} = state, issue_id, running_entry) do
     record = build_completed_record(issue_id, running_entry, state.project_name)
@@ -1294,7 +1443,7 @@ defmodule CymphonyElixir.Orchestrator do
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
 
-      retry_candidate_issue?(issue, active_state_set(state), queued_state_set(state), terminal_states) ->
+      retry_candidate_issue?(issue, active_state_set(state), queued_state_set(state), terminal_states, state) ->
         handle_active_retry(state, issue, attempt, metadata)
 
       true ->
@@ -1387,7 +1536,10 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(%State{} = state, issue, attempt, metadata) do
-    if retry_candidate_issue?(issue, active_state_set(state), queued_state_set(state), terminal_state_set(state)) and
+    retry_candidate? =
+      retry_candidate_issue?(issue, active_state_set(state), queued_state_set(state), terminal_state_set(state), state)
+
+    if retry_candidate? and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
       {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host], failures: metadata[:failures] || 0)}
@@ -2400,14 +2552,14 @@ defmodule CymphonyElixir.Orchestrator do
     Agent.put_section(config, kind, %{section | provider: provider, providers: providers})
   end
 
-  defp retry_candidate_issue?(%Issue{} = issue, active_states, queued_states, terminal_states) do
-    candidate_issue?(issue, active_states, terminal_states) and
-      !queued_issue_blocked_by_non_terminal?(issue, queued_states, terminal_states)
+  defp retry_candidate_issue?(%Issue{} = issue, active_states, queued_states, terminal_states, gate_state) do
+    candidate_issue?(issue, active_states, terminal_states, gate_state) and
+      !queued_issue_blocked_by_non_terminal?(issue, queued_states, terminal_states, gate_state)
   end
 
-  defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
-    candidate_issue?(issue, active_state_set(), terminal_states) and
-      !queued_issue_blocked_by_non_terminal?(issue, queued_state_set(), terminal_states)
+  defp retry_candidate_issue?(%Issue{} = issue, terminal_states, gate_state) do
+    candidate_issue?(issue, active_state_set(), terminal_states, gate_state) and
+      !queued_issue_blocked_by_non_terminal?(issue, queued_state_set(), terminal_states, gate_state)
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
