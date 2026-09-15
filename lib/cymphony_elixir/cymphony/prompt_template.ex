@@ -46,7 +46,9 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
   (`{{ forge.cli }} ... {{ forge.review_base_flag }} {{ base_branch }}`) rather
   than relying on the repository default branch, which is not necessarily the
   base for this issue. Every instruction below that names
-  `origin/{{ base_branch }}` means this branch and no other.
+  `origin/{{ base_branch }}` means this branch and no other.{% if forge.review_squash_flag %} Open
+  it with `{{ forge.review_squash_flag }}` so it lands on `{{ base_branch }}` as a
+  single squashed commit.{% endif %}
 
   If `origin/{{ base_branch }}` does not exist on the remote, create it from the
   repository default branch and push it before cutting your own branch. This is
@@ -115,7 +117,8 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
   {% endif %}   - A terminal state -> do nothing and shut down.
   4. Check whether a {{ forge.review_abbr }} already exists for the current branch, whether it is closed, and what it targets.
      - If an open {{ forge.review_abbr }} targets anything other than `{{ base_branch }}`, retarget it now with `{{ forge.review_retarget_command }} {{ base_branch }}`.
-     - If a branch {{ forge.review_abbr }} exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
+  {% if forge.review_squash_flag %}   - If an open {{ forge.review_abbr }} does not have squash enabled, enable it now with `{{ forge.review_squash_command }}`.
+  {% endif %}   - If a branch {{ forge.review_abbr }} exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
      - Create a fresh branch named exactly `{{ branch_name }}` and restart execution flow as a new attempt.
   5. For queued tickets, do startup sequencing in this exact order:
      - move the ticket to `{{ workflow.in_progress_state }}`
@@ -228,13 +231,15 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
   6.  Re-check all acceptance criteria and close any gaps.
   7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
   8.  Open the {{ forge.review_abbr }} if one is not already attached, naming the base explicitly:
-      `{{ forge.cli }} {{ forge.review_open_command }} {{ forge.review_base_flag }} {{ base_branch }}`.
+      `{{ forge.cli }} {{ forge.review_open_command }} {{ forge.review_base_flag }} {{ base_branch }}{% if forge.review_squash_flag %} {{ forge.review_squash_flag }}{% endif %}`.
       - Never omit `{{ forge.review_base_flag }}`. Without it {{ forge.cli }} targets the repository default branch, which is not the base for this issue.
-  9.  Verify the {{ forge.review_abbr }} targets `{{ base_branch }}`, whether you just opened it or it was already attached:
+  {% if forge.review_squash_flag %}    - Never omit `{{ forge.review_squash_flag }}` either. Squash is a property of the {{ forge.review_abbr }}, not a choice made at merge time, so it has to be set when the {{ forge.review_abbr }} is opened.
+  {% endif %}9.  Verify the {{ forge.review_abbr }} targets `{{ base_branch }}`, whether you just opened it or it was already attached:
       - Read the current target with `{{ forge.review_target_command }}`.
       - If it is anything other than `{{ base_branch }}`, retarget it with `{{ forge.review_retarget_command }} {{ base_branch }}` and read it back again to confirm.
       - An {{ forge.review_abbr }} opened before this issue gained its parent will still point at the old base; fixing it is part of this run, not a human's job.
-  10. Attach {{ forge.review_abbr }} URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
+  {% if forge.review_squash_flag %}    - Read the squash setting back with `{{ forge.review_squash_check_command }}`; if it is not enabled, enable it with `{{ forge.review_squash_command }}`. An {{ forge.review_abbr }} opened by an earlier run predates this rule.
+  {% endif %}10. Attach {{ forge.review_abbr }} URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
       - Ensure the {{ forge.name }} {{ forge.review_abbr }} has label `cymphony` (add it if missing).
   11. Merge latest `origin/{{ base_branch }}` into branch, resolve conflicts, and rerun checks.
   12. Update the workpad comment with final checklist status and validation notes.

@@ -32,7 +32,7 @@ defmodule CymphonyElixir.PromptBuilder do
       %{
         "attempt" => Keyword.get(opts, :attempt),
         "issue" => issue |> Map.from_struct() |> to_solid_map(),
-        "forge" => forge_variables(Keyword.get(opts, :forge) || forge_kind(config)),
+        "forge" => forge_variables(Keyword.get(opts, :forge) || forge_kind(config), squash_merge?(config)),
         "branch_name" => branch_name(issue, branch_template(config)),
         "base_branch" => base_branch(issue, config),
         "workflow" => workflow_variables(config),
@@ -51,9 +51,21 @@ defmodule CymphonyElixir.PromptBuilder do
   the three review-reading commands — is a variable rather than a second copy
   of the template. Rendering runs with `strict_variables: true`, so this map is
   always supplied, including for a hand-authored prompt that never reads it.
+
+  `squash?` is `config.squash_merge`. It only has a meaning on GitLab, where
+  squash is an attribute of the merge request and so has to be set when the MR
+  is opened; GitHub picks it at merge time (`gh pr merge --squash`) and has
+  nothing to set, so the three squash variables are `nil` there either way and
+  the template's `{% if forge.review_squash_flag %}` blocks drop out entirely.
   """
   @spec forge_variables(String.t() | nil) :: map()
-  def forge_variables("gitlab") do
+  def forge_variables(kind), do: forge_variables(kind, true)
+
+  @doc """
+  `forge_variables/1` with squashing decided by `config.squash_merge`.
+  """
+  @spec forge_variables(String.t() | nil, boolean()) :: map()
+  def forge_variables("gitlab", squash?) do
     %{
       "name" => "GitLab",
       "cli" => "glab",
@@ -64,13 +76,16 @@ defmodule CymphonyElixir.PromptBuilder do
       "review_open_command" => "mr create",
       "review_target_command" => "glab mr view --json targetBranch",
       "review_retarget_command" => "glab mr update --target-branch",
+      "review_squash_flag" => squash_variable(squash?, "--squash-before-merge"),
+      "review_squash_check_command" => squash_variable(squash?, "glab mr view --json squash"),
+      "review_squash_command" => squash_variable(squash?, "glab mr update --squash-before-merge"),
       "comments_command" => "glab mr view --comments",
       "inline_comments_command" => "glab api projects/:id/merge_requests/<mr>/notes",
       "reviews_command" => "glab mr view --json reviewers,approvalsRequired"
     }
   end
 
-  def forge_variables(_kind) do
+  def forge_variables(_kind, _squash?) do
     %{
       "name" => "GitHub",
       "cli" => "gh",
@@ -81,6 +96,9 @@ defmodule CymphonyElixir.PromptBuilder do
       "review_open_command" => "pr create",
       "review_target_command" => "gh pr view --json baseRefName",
       "review_retarget_command" => "gh pr edit --base",
+      "review_squash_flag" => nil,
+      "review_squash_check_command" => nil,
+      "review_squash_command" => nil,
       "comments_command" => "gh pr view --comments",
       "inline_comments_command" => "gh api repos/<owner>/<repo>/pulls/<pr>/comments",
       "reviews_command" => "gh pr view --json reviews"
@@ -89,6 +107,17 @@ defmodule CymphonyElixir.PromptBuilder do
 
   defp forge_kind(%{forge: forge}) when is_binary(forge), do: forge
   defp forge_kind(_config), do: nil
+
+  # Only an explicit `false` turns squashing off. A `LenientBoolean` that could
+  # not cast the operator's value leaves `nil` here, which must keep the
+  # default: the failure mode of the other direction is every sub-task landing
+  # on its parent as a string of commits, silently.
+  defp squash_merge?(%{squash_merge: false}), do: false
+  defp squash_merge?(_config), do: true
+
+  # A blank string is truthy in Liquid, so an unset variable has to be `nil`.
+  defp squash_variable(true, value), do: value
+  defp squash_variable(_squash?, _value), do: nil
 
   defp branch_template(%{branch_name_template: template}) when is_binary(template) and template != "",
     do: template

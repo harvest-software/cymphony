@@ -884,6 +884,7 @@ defmodule CymphonyElixir.Cymphony.Config do
     |> Map.put("forge", forge(config))
     |> Map.put("branch_name_template", tracker_state(config, "branch_name_template", Defaults.branch_name_template()))
     |> Map.put("base_branch", tracker_state(config, "base_branch", Defaults.base_branch()))
+    |> maybe_put_squash_merge(config)
     |> maybe_put_string(config, "forge_token", "forge_token")
     |> maybe_put_string(config, "forge_host", "forge_host")
     |> maybe_put_server(config)
@@ -1166,6 +1167,17 @@ defmodule CymphonyElixir.Cymphony.Config do
     case Map.get(config, "claude_bare_mode") do
       false -> Map.put(section, "bare_mode", false)
       _ -> section
+    end
+  end
+
+  # Squashing is on by default, so only an explicit `false` needs to reach the
+  # front matter. Anything else (missing, `"false"`, `0`) keeps squashing: a
+  # typo here silently lands every sub-task as a string of commits on its
+  # parent branch, which is exactly what the epic workflow is trying to avoid.
+  defp maybe_put_squash_merge(base, config) do
+    case Map.get(config, "squash_merge") do
+      false -> Map.put(base, "squash_merge", false)
+      _ -> base
     end
   end
 

@@ -52,6 +52,57 @@ defmodule CymphonyElixir.PromptBuilderForgeTest do
     refute prompt =~ "GitHub"
   end
 
+  test "a GitLab merge request is opened squashed, and an existing one is fixed" do
+    # Squash is a property of the MR, not a merge-time choice, so it has to be
+    # set when the MR is opened — and an MR opened by an earlier run predates
+    # the rule, which is what the read-back is for.
+    prompt = render("gitlab")
+
+    assert prompt =~ "glab mr create --target-branch main --squash-before-merge"
+    assert prompt =~ "glab mr view --json squash"
+    assert prompt =~ "glab mr update --squash-before-merge"
+  end
+
+  test "GitHub renders no squash instruction at all" do
+    # There is no PR-level squash attribute on GitHub; it is chosen at merge
+    # time (`gh pr merge --squash`), so the whole block drops out.
+    prompt = render(nil)
+
+    refute prompt =~ "squash"
+    refute prompt =~ "Squash"
+  end
+
+  test "squash_merge: false drops the squash instructions without disabling anything else" do
+    # `false` means "leave the project's own default alone", not "tell the agent
+    # to turn squashing off" — so the prompt simply says nothing about it.
+    {:ok, config} = Schema.parse(%{"forge" => "gitlab", "squash_merge" => false})
+
+    prompt = PromptBuilder.build_prompt(issue(), prompt_template: PromptTemplate.get(), config: config)
+
+    refute prompt =~ "squash"
+    assert prompt =~ "glab mr create --target-branch main"
+    assert PromptBuilder.forge_variables("gitlab", false)["review_squash_flag"] == nil
+  end
+
+  test "only an explicit false turns squashing off" do
+    # `LenientBoolean` leaves an uncastable value as nil, which must keep the
+    # default: the other direction lands every sub-task as a string of commits.
+    {:ok, default} = Schema.parse(%{"forge" => "gitlab"})
+    {:ok, typo} = Schema.parse(%{"forge" => "gitlab", "squash_merge" => "yes"})
+    {:ok, spelled} = Schema.parse(%{"forge" => "gitlab", "squash_merge" => "false"})
+
+    assert default.squash_merge == true
+    assert typo.squash_merge == nil
+    assert spelled.squash_merge == false
+
+    for config <- [default, typo] do
+      assert PromptBuilder.build_prompt(issue(), prompt_template: PromptTemplate.get(), config: config) =~
+               "--squash-before-merge"
+    end
+
+    refute PromptBuilder.build_prompt(issue(), prompt_template: PromptTemplate.get(), config: spelled) =~ "squash"
+  end
+
   test "takes the forge from the resolved workflow config when no override is given" do
     {:ok, config} = Schema.parse(%{"forge" => "gitlab"})
 

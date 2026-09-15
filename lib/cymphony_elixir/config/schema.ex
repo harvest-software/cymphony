@@ -524,6 +524,13 @@ defmodule CymphonyElixir.Config.Schema do
     # does the same. The prompt renders this as `origin/{{ base_branch }}`,
     # which used to be a hardcoded `origin/main` in six places.
     field(:base_branch, :string, default: "main")
+    # Whether a review is opened set to squash-merge. GitLab only: squash is an
+    # attribute of the merge request, set when it is opened, while GitHub picks
+    # it at merge time (`gh pr merge --squash`) and has nothing to set. `false`
+    # drops every squash instruction from the prompt and leaves the project's
+    # own default alone. Lenient, like `new_project`: a typo must not take the
+    # project down, and must not silently stop squashing either.
+    field(:squash_merge, LenientBoolean, default: true)
     # Forge credentials, so the agent can drive `glab`/`gh`. The tracker's
     # credential already lives in config; the forge's had been shell-env only,
     # which meant it silently vanished whenever the daemon was started from a
@@ -596,9 +603,11 @@ defmodule CymphonyElixir.Config.Schema do
     end)
   end
 
+  @top_level_fields [:forge, :branch_name_template, :base_branch, :squash_merge, :forge_token, :forge_host]
+
   defp changeset(attrs) do
     %__MODULE__{}
-    |> cast(attrs, [:forge, :branch_name_template, :base_branch, :forge_token, :forge_host], empty_values: [])
+    |> cast(attrs, @top_level_fields, empty_values: [])
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)

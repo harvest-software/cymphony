@@ -476,6 +476,17 @@ Note:
   base reaches the hook through the environment rather than being interpolated, and the
   hook falls back to a plain clone when the base branch does not exist yet.
 
+#### 5.3.0.3 `squash_merge` (boolean)
+
+- Whether the agent opens the review set to squash-merge. Default: `true`.
+- GitLab only. Squash is an attribute of the merge request, so it has to be set when the MR
+  is opened (`--squash-before-merge`) and can be fixed afterwards on one already attached.
+  GitHub has no PR-level equivalent — squash is chosen at merge time — so the setting has no
+  effect there and the prompt says nothing about squash in a GitHub rendering.
+- `false` means "leave the project's own default alone", not "turn squashing off". Only an
+  explicit `false` counts; anything that does not cast cleanly keeps squashing, because the
+  other direction lands every sub-task on its parent branch as a string of commits.
+
 #### 5.3.1 `tracker` (object)
 
 Fields:
@@ -1026,6 +1037,7 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `tracker.version_field`: string, default `"Version"`
 - `tracker.merge_to_parent_version`: string, default `"Merge to Parent Feature Branch"`
 - `base_branch`: string, default `"main"`; base unless the issue is opted in to its parent
+- `squash_merge`: boolean, default `true`; open the review set to squash-merge (GitLab only)
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path, default `<system-temp>/cymphony_workspaces`
 - `worker.ssh_hosts` (extension): list of SSH host strings, optional; when omitted, work runs
@@ -1343,6 +1355,20 @@ spelled out, and then reads the target back and retargets it if it is wrong. The
 also runs on re-entry for an already-attached review, which is what corrects one opened
 before the issue gained its parent. A repository is not assumed to ship a skill that gets
 this right, and a forge CLI given no base flag silently targets the repository default.
+
+On GitLab the same step also sets squash: `glab mr create … --squash-before-merge`, read
+back with `glab mr view --json squash` and fixed with `glab mr update --squash-before-merge`
+when it is off. Squash is a property of the merge request, not a choice made at merge time,
+so it has to be set when the MR is opened — and the dependency gate already assumes
+squash-merged sub-tasks (a squashed dependency is never an ancestor of its base, which is
+why the forge query in step 3 is not optional). GitHub has no PR-level equivalent — squash
+is chosen at merge time (`gh pr merge --squash`) — so `forge.review_squash_flag` is `nil`
+there and the whole block drops out of the rendered prompt.
+
+`squash_merge` (top-level, default `true`, generated from a same-named `projects[]` key)
+turns the instructions off. `false` means "leave the project's own default alone", not "turn
+squashing off"; only an explicit `false` counts, so a typo keeps squashing rather than
+silently disabling it.
 
 Global / per-state / per-host slot checks are **not** membership filters; they apply when
 walking `waiting` to dispatch (below).

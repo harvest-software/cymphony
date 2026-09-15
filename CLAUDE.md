@@ -246,6 +246,25 @@ parent. The prompt also instructs the agent to create and push `origin/<base>` f
 repository default branch if it does not exist — the normal state before the first sub-task of
 a new parent runs.
 
+**GitLab merge requests are opened squashed** (`squash_merge`, top-level, default `true`,
+generated from a same-named `projects[]` key). `forge.review_squash_flag`
+(`--squash-before-merge`) rides along on the same create command, and the same read-back step
+checks it (`forge.review_squash_check_command`, `glab mr view --json squash`) and turns it on
+(`forge.review_squash_command`, `glab mr update --squash-before-merge`) when it is off. Squash
+is an attribute of the MR, not a merge-time choice, so it has to be set at open — and the
+dependency gate is built on the assumption that sub-tasks land squashed (step 3's forge query
+exists precisely because a squashed dependency is never an ancestor of its base). All three
+variables are `nil` for GitHub, where squash is `gh pr merge --squash` at merge time and there
+is nothing to set on the PR; the template guards each on `{% if forge.review_squash_flag %}`,
+so the GitHub rendering contains no mention of squash at all.
+
+`squash_merge: false` drops those blocks from a GitLab rendering too — it means "leave the
+project's own default alone", never "tell the agent to turn squashing off". Like
+`new_project`, **only an explicit `false`** counts: the field casts through
+`Schema.LenientBoolean`, so `"false"` and `"0"` parse but `0` / `"no"` / `"off"` are logged
+and left as `nil`, which keeps squashing on. The failure mode of the other direction is every
+sub-task landing on its parent branch as a string of commits, silently.
+
 ### Feature-branch containers
 
 An issue tagged `tracker.feature_branch_label` holds the branch its children merge into and

@@ -619,6 +619,28 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
     end
   end
 
+  describe "to_schema_map/1 squash_merge" do
+    test "the default is omitted so reviews keep opening squashed" do
+      schema_map = CymphonyConfig.to_schema_map(%{})
+      refute Map.has_key?(schema_map, "squash_merge")
+      assert {:ok, %Schema{} = parsed} = Schema.parse(schema_map)
+      assert parsed.squash_merge == true
+    end
+
+    test "only an explicit false reaches the front matter" do
+      # A typo must not silently land every sub-task on its parent branch as a
+      # string of commits, which is what the epic workflow exists to avoid.
+      schema_map = CymphonyConfig.to_schema_map(%{"squash_merge" => false})
+      assert schema_map["squash_merge"] == false
+      assert {:ok, %Schema{} = parsed} = Schema.parse(schema_map)
+      assert parsed.squash_merge == false
+
+      for truthy <- [true, "false", 0, nil] do
+        refute Map.has_key?(CymphonyConfig.to_schema_map(%{"squash_merge" => truthy}), "squash_merge")
+      end
+    end
+  end
+
   describe "generated WORKFLOW.md front matter round-trips safely" do
     test "values with YAML metacharacters survive generation and parsing" do
       # The old hand-built-YAML path would corrupt these (`:`, `#`, quotes);
