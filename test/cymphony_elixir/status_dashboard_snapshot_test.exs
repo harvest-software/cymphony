@@ -371,6 +371,89 @@ defmodule CymphonyElixir.StatusDashboardSnapshotTest do
     end
   end
 
+  describe "claude stream-json event humanization" do
+    defp claude_event(payload), do: StatusDashboard.humanize_agent_message(%{event: :stream_event, message: payload})
+
+    defp assistant(blocks), do: %{"type" => "assistant", "session_id" => "s-1", "message" => %{"content" => blocks}}
+
+    test "a Skill call names the skill instead of rendering as a bare type" do
+      humanized =
+        claude_event(
+          assistant([
+            %{"type" => "tool_use", "name" => "Skill", "input" => %{"skill" => "harvest-frontend-stack:harvest-frontend-stack"}}
+          ])
+        )
+
+      assert humanized == "Skill: harvest-frontend-stack:harvest-frontend-stack"
+    end
+
+    test "tool calls show their most telling argument" do
+      assert claude_event(
+               assistant([
+                 %{"type" => "tool_use", "name" => "Bash", "input" => %{"command" => "mix test", "description" => "Run tests"}}
+               ])
+             ) == "Bash: Run tests"
+
+      assert claude_event(assistant([%{"type" => "tool_use", "name" => "Bash", "input" => %{"command" => "mix test"}}])) ==
+               "Bash: mix test"
+
+      assert claude_event(assistant([%{"type" => "tool_use", "name" => "Edit", "input" => %{"file_path" => "/w/lib/a.ex"}}])) ==
+               "Edit: /w/lib/a.ex"
+
+      assert claude_event(assistant([%{"type" => "tool_use", "name" => "Grep", "input" => %{"pattern" => "defp foo"}}])) ==
+               "Grep: defp foo"
+
+      assert claude_event(assistant([%{"type" => "tool_use", "name" => "mcp__youtrack__get_issue", "input" => %{}}])) ==
+               "mcp__youtrack__get_issue"
+    end
+
+    test "assistant text and thinking" do
+      assert claude_event(assistant([%{"type" => "text", "text" => "Vendor isn't\ninstalled."}])) == "Vendor isn't installed."
+      assert claude_event(assistant([%{"type" => "thinking", "thinking" => "hmm"}])) == "thinking"
+      assert claude_event(assistant([])) == "assistant"
+    end
+
+    test "tool results, errors surfaced with their text" do
+      ok = %{"type" => "user", "session_id" => "s-1", "message" => %{"content" => [%{"type" => "tool_result", "content" => "fine"}]}}
+      assert claude_event(ok) == "tool result"
+
+      error = %{
+        "type" => "user",
+        "session_id" => "s-1",
+        "message" => %{
+          "content" => [
+            %{"type" => "tool_result", "is_error" => true, "content" => [%{"type" => "text", "text" => "command not found: docker"}]}
+          ]
+        }
+      }
+
+      assert claude_event(error) == "tool error: command not found: docker"
+
+      prompt = %{"type" => "user", "session_id" => "s-1", "message" => %{"content" => "hello"}}
+      assert claude_event(prompt) == "user message"
+    end
+
+    test "init reports model and skill count; result reports outcome" do
+      init = %{
+        "type" => "system",
+        "subtype" => "init",
+        "session_id" => "s-1",
+        "model" => "claude-opus-5-5",
+        "skills" => ["a", "b", "harvest-frontend-stack:harvest-frontend-stack"]
+      }
+
+      assert claude_event(init) == "session init (claude-opus-5-5, 3 skills)"
+      assert claude_event(%{"type" => "system", "subtype" => "init", "session_id" => "s-1"}) == "session init"
+      assert claude_event(%{"type" => "system", "subtype" => "compact_boundary", "session_id" => "s-1"}) == "system: compact_boundary"
+
+      assert claude_event(%{"type" => "result", "subtype" => "success", "num_turns" => 12, "session_id" => "s-1"}) ==
+               "result: success (12 turns)"
+
+      assert claude_event(%{"type" => "result", "subtype" => "error_max_turns", "is_error" => true, "session_id" => "s-1"}) ==
+               "result: error_max_turns"
+    end
+  end
+
   describe "antigravity NDJSON event humanization" do
     test "init includes a shortened conversation id" do
       humanized =

@@ -42,4 +42,12 @@ if [ -z "${GITLAB_TOKEN:-}" ] && [ -z "${GH_TOKEN:-}" ] && ! git config --get-re
   log "warning: no forge token and no git credential helper configured; cloning a private repo and opening merge requests will fail"
 fi
 
+# An agent that needs a compose dev stack silently falls back to host tooling
+# without this, so say so at boot rather than in the middle of a run.
+if [ ! -S /var/run/docker.sock ]; then
+  log "warning: no container engine socket at /var/run/docker.sock; agents cannot run docker/compose (set CYMPHONY_DOCKER_SOCK)"
+elif ! docker version >/dev/null 2>&1; then
+  log "warning: /var/run/docker.sock is mounted but not usable by uid $(id -u); check the socket's group and the keep_original_groups annotation"
+fi
+
 exec "$@"

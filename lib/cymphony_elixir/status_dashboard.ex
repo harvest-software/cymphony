@@ -16,6 +16,11 @@ defmodule CymphonyElixir.StatusDashboard do
   @throughput_graph_window_ms 10 * 60 * 1000
   @throughput_graph_columns 24
   @sparkline_blocks ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+  # Claude Code `stream-json` event types. They carry {"type": "…"} like
+  # Codex's JSONL, so without their own humanizer every Claude event rendered
+  # as its bare type ("assistant", "user") and a tool call — `Skill` included —
+  # was indistinguishable from any other activity.
+  @claude_stream_types ["system", "assistant", "user", "result"]
   @running_id_width 8
   @running_stage_width 14
   @running_pid_width 8
@@ -1514,6 +1519,9 @@ defmodule CymphonyElixir.StatusDashboard do
       {_, method, _} when is_binary(method) ->
         humanize_agent_method(method, payload)
 
+      {_, _, type} when type in @claude_stream_types ->
+        humanize_claude_event(type, payload)
+
       {_, _, type} when is_binary(type) ->
         humanize_codex_event(type, payload)
 
@@ -1553,6 +1561,138 @@ defmodule CymphonyElixir.StatusDashboard do
         |> String.trim()
     end
   end
+
+  defp humanize_claude_event("system", payload) do
+    case map_value(payload, ["subtype", :subtype]) do
+      "init" ->
+        skills = map_value(payload, ["skills", :skills])
+        model = map_value(payload, ["model", :model])
+
+        [
+          if(is_binary(model), do: model),
+          if(is_list(skills), do: "#{length(skills)} skills")
+        ]
+        |> Enum.reject(&is_nil/1)
+        |> case do
+          [] -> "session init"
+          parts -> "session init (#{Enum.join(parts, ", ")})"
+        end
+
+      subtype when is_binary(subtype) ->
+        "system: #{subtype}"
+
+      _ ->
+        "system"
+    end
+  end
+
+  defp humanize_claude_event("assistant", payload) do
+    payload
+    |> claude_content_blocks()
+    |> Enum.map(&humanize_claude_assistant_block/1)
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> "assistant"
+      parts -> Enum.join(parts, "; ")
+    end
+  end
+
+  defp humanize_claude_event("user", payload) do
+    blocks = claude_content_blocks(payload)
+    results = Enum.filter(blocks, &(map_value(&1, ["type", :type]) == "tool_result"))
+
+    cond do
+      results == [] ->
+        "user message"
+
+      error = Enum.find(results, &(map_value(&1, ["is_error", :is_error]) == true)) ->
+        case claude_block_text(map_value(error, ["content", :content])) do
+          "" -> "tool error"
+          text -> "tool error: #{inline_text(text)}"
+        end
+
+      true ->
+        "tool result"
+    end
+  end
+
+  defp humanize_claude_event("result", payload) do
+    turns = map_value(payload, ["num_turns", :num_turns])
+    suffix = if is_integer(turns), do: " (#{turns} turns)", else: ""
+
+    case {map_value(payload, ["subtype", :subtype]), map_value(payload, ["is_error", :is_error])} do
+      {"success", is_error} when is_error != true -> "result: success" <> suffix
+      {subtype, _} when is_binary(subtype) -> "result: #{subtype}" <> suffix
+      _ -> "result" <> suffix
+    end
+  end
+
+  defp claude_content_blocks(payload) do
+    case map_path(payload, ["message", "content"]) || map_path(payload, [:message, :content]) do
+      blocks when is_list(blocks) -> Enum.filter(blocks, &is_map/1)
+      _ -> []
+    end
+  end
+
+  defp humanize_claude_assistant_block(block) do
+    case map_value(block, ["type", :type]) do
+      "tool_use" ->
+        humanize_claude_tool_use(block)
+
+      "text" ->
+        case map_value(block, ["text", :text]) do
+          text when is_binary(text) and text != "" -> inline_text(text)
+          _ -> nil
+        end
+
+      "thinking" ->
+        "thinking"
+
+      _ ->
+        nil
+    end
+  end
+
+  defp humanize_claude_tool_use(block) do
+    name = map_value(block, ["name", :name]) || "tool"
+    input = map_value(block, ["input", :input]) || %{}
+
+    case claude_tool_detail(name, input) do
+      detail when is_binary(detail) and detail != "" -> "#{name}: #{inline_text(detail)}"
+      _ -> name
+    end
+  end
+
+  # The one argument that says what the call is *for*: the skill name for
+  # `Skill`, the operator-facing description (else the command) for `Bash`,
+  # the path for file tools, the pattern for search tools.
+  defp claude_tool_detail("Skill", input), do: map_value(input, ["skill", :skill])
+  defp claude_tool_detail("Bash", input), do: map_value(input, ["description", :description, "command", :command])
+
+  defp claude_tool_detail(name, input) when name in ["Read", "Edit", "Write", "NotebookEdit"],
+    do: map_value(input, ["file_path", :file_path, "notebook_path", :notebook_path])
+
+  defp claude_tool_detail(name, input) when name in ["Grep", "Glob"], do: map_value(input, ["pattern", :pattern])
+
+  defp claude_tool_detail(name, input) when name in ["Task", "Agent"],
+    do: map_value(input, ["description", :description])
+
+  defp claude_tool_detail(_name, input), do: map_value(input, ["description", :description])
+
+  defp claude_block_text(content) when is_binary(content), do: content
+
+  defp claude_block_text(content) when is_list(content) do
+    content
+    |> Enum.map(fn
+      %{} = part -> map_value(part, ["text", :text])
+      text when is_binary(text) -> text
+      _ -> nil
+    end)
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join(" ")
+  end
+
+  defp claude_block_text(_content), do: ""
 
   # Codex `exec --json` events carry {"type": "…"} (dot-separated) rather than
   # the {"method": "…"} shape of the app-server protocol above.

@@ -823,6 +823,22 @@ that user's real home.
   short-name resolution and refuses a bare name non-interactively.
 - Provider rotation works here (unlike a locked-down container): `zsh` is in the
   image and `~/.cld` is part of the mounted home.
+- **Agents get the host container engine.** The image ships the Docker CLI +
+  Compose/Buildx plugins (client only) and compose mounts
+  `${CYMPHONY_DOCKER_SOCK:-/var/run/docker.sock}` at `/var/run/docker.sock`, the
+  CLI default, so no `DOCKER_HOST` has to cross the agent's curated env. Without
+  it a repository whose dev stack is a compose project (harvest_frontend's
+  `./build.sh`, driven by the `harvest-frontend-stack` skill) loads the skill,
+  hits `docker: command not found`, and quietly falls back to host tooling.
+  keep-id drops supplementary groups, so the `docker` group that grants the
+  socket is gone; `group_add: keep-groups` is rejected over the Docker API that
+  `podman compose` uses (`Unable to find group keep-groups`), hence the crun
+  annotation `run.oci.keep_original_groups: "1"` — the group reads `nogroup`
+  inside and access still works. Stack bind mounts resolve on the host, which
+  is fine because workspaces live under the same-path `$HOME` mount. Rootless
+  Podman: `CYMPHONY_DOCKER_SOCK=$XDG_RUNTIME_DIR/podman/podman.sock`; neither:
+  `/dev/null` (the source must exist) and the entrypoint warns. The socket is
+  root-equivalent for rootful Docker.
 - **Agent toolchains are bundled, not borrowed from the home mount.** The
   image installs the .NET SDK to `/usr/local/dotnet` (`DOTNET_ROOT`) and
   Playwright's Chromium to `/usr/local/ms-playwright`
@@ -884,6 +900,8 @@ The Phoenix LiveView dashboard (`lib/cymphony_elixir_web/live/dashboard_live.ex`
 | `set_refresh_interval` | Settings Automation: persist top-level `dashboard_refresh_seconds` from `#drawer-refresh-interval` (min 1, default 3). Does **not** change Linear `polling.interval_ms` or `POST /api/v1/refresh`. Open dashboards keep their assign until remount or this event. |
 
 Each running session row shows the Linear issue identifier (linked to the issue), title (or last activity message when no title), state, provider, host, runtime, and total tokens at a glance. Expanding the row reveals priority badge, session ID, workspace path, and recent log events.
+
+Claude `stream-json` events (`system` / `assistant` / `user` / `result`) have their own humanizer, `humanize_claude_event/2` in `status_dashboard.ex`, dispatched ahead of the Codex one: both carry `{"type": …}`, and falling through to Codex rendered every Claude event as its bare type, so a `Skill` call was invisible. Tool calls render as `<Tool>: <the one telling argument>` (`Skill: <skill>`, `Bash: <description, else command>`, a file path, a search pattern), failed tool results as `tool error: <text>`, init as `session init (<model>, N skills)`.
 
 Theme toggle is purely client-side (CSS geometry on `.theme-toggle-button`, no emoji) — sets `data-theme` on `<html>` and persists to localStorage; system mode clears it to follow the OS `prefers-color-scheme` setting. `dashboard.css` ships the light palette twice: once under `:root[data-theme="light"]` and once under `@media (prefers-color-scheme: light) { :root:not([data-theme]) }`. Vanilla CSS cannot share a declaration block between an attribute selector and a media query, so the two are a maintained duplicate — edit both together. The `:not([data-theme])` guard keeps an explicit `dark` choice dark on a light OS.
 

@@ -48,6 +48,7 @@ To skip compose entirely, the equivalent invocation is:
 podman run --rm -it \
   --userns=keep-id --security-opt label=disable --network=host \
   -v "$HOME:$HOME" -e HOME="$HOME" -w "$HOME" \
+  -v /var/run/docker.sock:/var/run/docker.sock --group-add keep-groups \
   -e GITLAB_TOKEN -e GITLAB_HOST \
   localhost/cymphony:local
 ```
@@ -60,6 +61,30 @@ podman run --rm -it \
 | `security_opt: label=disable` | SELinux. **Never** put `:z`/`:Z` on the `$HOME` mount: that recursively relabels your entire home directory. Disabling the label for this container is the right trade for a sandbox meant to see your home. |
 | `network_mode: host` | Keeps the dashboard where a native run puts it, so `server.host` stays `127.0.0.1` in your config and nothing about the config differs between containerized and native. |
 | `-v $HOME:$HOME` | Your real home at the same path, so workspace paths in the dashboard and logs are valid on the host too. |
+| `-v ${CYMPHONY_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock` | The host container engine, for agents whose repository runs a compose dev stack (see below). |
+| `annotations: run.oci.keep_original_groups: "1"` | keep-id drops your supplementary groups, including the `docker` group that grants the socket. This is what `--group-add keep-groups` sets; compose has to spell it as the crun annotation because the Docker API rejects `keep-groups`. |
+
+### Container engine for agents
+
+A repository whose dev stack is a compose project (harvest_frontend's
+`./build.sh up|stack|exec`, and the `harvest-frontend-stack` skill that drives
+it) needs `docker` inside the container. The image ships the Docker CLI with
+the Compose and Buildx plugins, client only; compose mounts the host engine's
+socket at `/var/run/docker.sock`, the CLI's default, so no `DOCKER_HOST` is
+involved. Without it the agent quietly falls back to host PHP/composer and
+never brings a stack up.
+
+- The default source is rootful Docker's `/var/run/docker.sock`. For rootless
+  Podman, export `CYMPHONY_DOCKER_SOCK=$XDG_RUNTIME_DIR/podman/podman.sock`
+  before `podman compose up`. On a host with neither, set it to `/dev/null`
+  (the source must exist); the entrypoint then warns at boot.
+- Stacks the agent starts are ordinary containers on the host engine, and the
+  bind mounts they declare resolve on the host. That works because every
+  workspace lives under `$HOME`, which is mounted at the same path.
+- Whoever can reach that socket controls every container on it, which is
+  root-equivalent for rootful Docker. That is consistent with this container
+  being a dependency sandbox rather than a security boundary, but it is a
+  bigger grant than the home mount alone.
 
 The image contains no application user and no `USER` directive — it is
 uid-agnostic, and the only writable paths it needs are your home and `/tmp`.
@@ -228,3 +253,5 @@ needed to look at state.
 | Agent fails with `Not logged in · Please run /login` | `claude_bare_mode` is not `false`, or `~/.claude` is not mounted. |
 | Dashboard not on `localhost:4000` | `server_port` is unset in `config.json`, or `network_mode: host` was replaced by port publishing without setting `server_host` to `0.0.0.0`. |
 | `glab` hits gitlab.com on a self-hosted instance | `GITLAB_HOST` is unset. |
+| `no container engine socket at /var/run/docker.sock` at boot, or the agent reports `docker: command not found` | An image built before the Docker CLI layer (`podman compose build`), or `CYMPHONY_DOCKER_SOCK` points at something that is not a socket. |
+| `/var/run/docker.sock is mounted but not usable` | The `docker` group did not survive keep-id: the `run.oci.keep_original_groups` annotation is missing, the runtime is not crun, or you were added to the group after your login session started. |

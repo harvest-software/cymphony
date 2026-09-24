@@ -47,6 +47,22 @@ services:
 
     volumes:
       - ${HOME}:${HOME}
+      # The host container engine, for agents whose repository runs its dev
+      # stack under compose. Mounted at the Docker CLI's default path so no
+      # DOCKER_HOST is needed. Defaults to rootful Docker; for rootless Podman
+      # set CYMPHONY_DOCKER_SOCK=$XDG_RUNTIME_DIR/podman/podman.sock. The
+      # source must exist — point it at /dev/null on a host with neither.
+      # Anyone who can reach this socket controls every container on it.
+      - ${CYMPHONY_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+
+    # keep-id drops supplementary groups, so the `docker` group that grants
+    # access to /var/run/docker.sock would be gone. `--group-add keep-groups`
+    # is the podman CLI spelling, but `podman compose` goes through the Docker
+    # API, which rejects that keyword ("Unable to find group keep-groups");
+    # this is the crun annotation it sets under the hood. Inside the container
+    # the group shows as `nogroup`, and access still works.
+    annotations:
+      run.oci.keep_original_groups: "1"
 
     working_dir: ${HOME}
     init: true

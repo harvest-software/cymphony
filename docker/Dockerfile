@@ -9,9 +9,10 @@
 # would use.
 #
 # Two stages: the pinned Elixir toolchain assembles an OTP release, and a slim
-# Erlang runtime carries it plus the toolchain the *agents* need — git, gh and
-# the Claude Code CLI. The dashboard's CSS/JS/icons are compiled into the beam
-# files (`CymphonyElixirWeb.StaticAssets`), so no asset pipeline is involved.
+# Erlang runtime carries it plus the toolchain the *agents* need — git, gh/glab,
+# the Docker CLI and the Claude Code CLI. The dashboard's CSS/JS/icons are
+# compiled into the beam files (`CymphonyElixirWeb.StaticAssets`), so no asset
+# pipeline is involved.
 #
 # A release, not the escript: escripts cannot carry a dependency's `priv/`
 # directory, and exqlite (the completion store) is a NIF — an escript build
@@ -143,6 +144,29 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends gh; \
     rm -rf /var/lib/apt/lists/*
+
+# Docker CLI + Compose/Buildx plugins, *client only* — no daemon runs here.
+# A repository whose dev stack is a compose project (harvest_frontend's
+# `./build.sh up|stack|exec`) needs them, and without them the agent silently
+# falls back to host tooling and never brings a stack up. compose.yaml mounts
+# the host engine's socket at /var/run/docker.sock, the CLI's default, so no
+# DOCKER_HOST has to reach the agent's curated environment. Bind mounts a
+# stack declares resolve on the *host*, which works because $HOME (and so
+# every workspace) is mounted at the same path.
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    . /etc/os-release; \
+    curl -fsSL https://download.docker.com/linux/debian/gpg \
+      -o /usr/share/keyrings/docker-archive-keyring.asc; \
+    chmod 644 /usr/share/keyrings/docker-archive-keyring.asc; \
+    echo "deb [arch=${arch} signed-by=/usr/share/keyrings/docker-archive-keyring.asc] https://download.docker.com/linux/debian ${VERSION_CODENAME} stable" \
+      > /etc/apt/sources.list.d/docker.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      docker-ce-cli docker-compose-plugin docker-buildx-plugin; \
+    rm -rf /var/lib/apt/lists/*; \
+    docker --version; \
+    docker compose version
 
 # Node is here only to host the Claude Code CLI.
 RUN set -eux; \
