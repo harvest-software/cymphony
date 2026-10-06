@@ -526,6 +526,7 @@ defmodule CymphonyElixir.Orchestrator do
 
         if is_pid(pid) do
           terminate_task(pid)
+          run_after_run_hook_for_killed(state, running_entry, cleanup_workspace)
         end
 
         if is_reference(ref) do
@@ -601,6 +602,31 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp terminate_task(_pid), do: :ok
+
+  # The killed task's own `after` block never ran, so its `after_run` did not
+  # either. A terminal issue's workspace is being removed (`before_remove`
+  # covers it). A task killed before it created a workspace has no path yet and
+  # never ran `before_run`, so there is nothing to undo.
+  defp run_after_run_hook_for_killed(_state, _running_entry, true = _cleanup_workspace), do: :ok
+
+  defp run_after_run_hook_for_killed(%State{} = state, running_entry, false) do
+    case Map.get(running_entry, :workspace_path) do
+      path when is_binary(path) ->
+        issue = Map.get(running_entry, :issue) || Map.get(running_entry, :identifier)
+        worker_host = Map.get(running_entry, :worker_host)
+
+        case Workspace.run_after_run_hook_detached(path, issue, worker_host, config: state_config(state)) do
+          :ok ->
+            :ok
+
+          :timeout ->
+            Logger.warning("after_run for killed task did not get its workspace lock in time workspace=#{path}; continuing")
+        end
+
+      _ ->
+        :ok
+    end
+  end
 
   defp attach_waiting(%State{} = state, issues) when is_list(issues) do
     eligible = filter_waiting_eligible(issues, state)

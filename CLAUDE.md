@@ -537,6 +537,44 @@ route, no dashboard control.
   logged and treated as unset — falling back to the default `true` — instead of failing
   `Schema.parse/1` and taking the project down over a typo'd boolean.
 
+### Per-project `hooks` (hand-edited config key)
+
+A `projects[].hooks` object (`after_create`, `before_run`, `after_run`, `before_remove`,
+`timeout_ms`) is merged into the generated `hooks` section by `maybe_put_hooks/2`. The use it
+exists for is preparing a per-workspace dev stack before the agent starts, so setup costs no
+agent turns:
+
+```json
+"hooks": {"before_run": "bash scripts/agent-stack.sh prepare",
+          "after_run": "./build.sh down",
+          "before_remove": "bash scripts/agent-stack.sh remove",
+          "timeout_ms": 600000}
+```
+
+- **The generated clone stays.** An operator `after_create` is chained after it as
+  `{ clone } && { operator }`, so it only runs on a populated checkout. Without a `repo_url` it
+  stands alone.
+- **Put slow setup in `before_run`, not `after_create`.** `after_create` runs under the
+  node-wide `with_after_create_lock` (it exists to stop a burst of `git clone`s), so an image
+  build there holds up every other dispatch. `before_run` runs once per attempt, unlocked, and
+  a failure fails that attempt into the retry queue. Make it idempotent.
+- `timeout_ms` applies to **every** hook. The 60s default is too short for a first image build.
+- **`after_run` must also run for a killed task, and that path is the orchestrator's job.**
+  `AgentRunner` runs it in an `after` block, which never runs when the orchestrator kills the
+  task. That kill is how the most common run ends: the agent moves the issue to review and
+  reconcile stops it. So `terminate_running_issue/3` calls `Workspace.run_after_run_hook_detached/4`
+  with the entry's `workspace_path`. It is skipped for a terminal state (the workspace is being
+  removed; `before_remove` covers it) and when there is no `workspace_path` yet.
+- **`before_run` and `after_run` share a per-workspace `:global` lock** (`with_run_hook_lock/3`).
+  `run_after_run_hook_detached/4` starts the hook in its own task and returns only once that task
+  holds the lock (or after `lock_wait_ms`, default 2000). A restart dispatched straight after the
+  kill then waits in its `before_run`. Without the handshake, a slow `after_run`
+  (`./build.sh down`) could land after the new attempt's `prepare` and take its stack down.
+- Validation follows `extra_args`: commands must be non-blank strings, `timeout_ms` a positive
+  integer. Anything else, including an unknown key, is dropped with
+  `Ignoring invalid hooks.<key> in config.json`. A bad operator `after_create` never costs the
+  project its clone.
+
 ### Generated `WORKFLOW.md` files (mode 0600)
 
 - Generated per-project workflow files embed the Linear API key in cleartext

@@ -626,6 +626,13 @@ Fields:
   - Runs after each agent attempt (success, failure, timeout, or cancellation) once the workspace
     exists.
   - Failure is logged but ignored.
+  - Includes an attempt the orchestrator kills: the issue left the active states, it stalled,
+    or an operator killed or restarted it. A killed worker cannot run its own cleanup, so the
+    orchestrator runs `after_run` for it. The exception is a move to a terminal state, where
+    the workspace is removed and `before_remove` runs instead.
+  - `before_run` and `after_run` for the same workspace never overlap. A retry or restart
+    dispatched straight after a kill waits in `before_run` until the killed attempt's
+    `after_run` has finished, so a slow `after_run` cannot undo the next attempt's setup.
 - `before_remove` (multiline shell script string, optional)
   - Runs before workspace deletion if the directory exists.
   - Failure is logged but ignored; cleanup still proceeds.
@@ -634,6 +641,31 @@ Fields:
   - Applies to all workspace hooks.
   - Non-positive values should be treated as invalid and fall back to the default.
   - Changes should be re-applied at runtime for future hook executions.
+
+Config-store write-through (extension): a `projects[].hooks` object in `~/.cymphony/config.json`
+is generated into this section. It takes the same five keys:
+
+```json
+"hooks": {
+  "before_run": "bash scripts/agent-stack.sh prepare",
+  "after_run": "./build.sh down",
+  "before_remove": "bash scripts/agent-stack.sh remove",
+  "timeout_ms": 600000
+}
+```
+
+- When the project has a `repo_url`, an operator `after_create` runs **after** the generated
+  clone and only if the clone succeeded (`{ clone } && { operator }`). It exists to prepare a
+  checkout, and until the clone has run there is no checkout to prepare.
+- Commands must be non-blank strings and `timeout_ms` a positive integer. Any other value, and
+  any unknown key, is dropped and logged as a warning (`Ignoring invalid hooks.<key> in
+  config.json`). A mistyped hook otherwise never runs and nothing says why. A bad operator hook
+  never removes the generated clone.
+- Long setup belongs in `before_run`, not `after_create`. `after_create` is serialized across
+  the node so that a burst of dispatches does not stampede `git clone`, so a slow
+  `after_create` holds up every other dispatch.
+- There is no CLI flag, API route, or dashboard control for it. Like `extra_args`, it is
+  operator-authored configuration and is trusted.
 
 #### 5.3.5 `agent` (object)
 

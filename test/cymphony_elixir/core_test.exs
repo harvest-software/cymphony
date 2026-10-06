@@ -295,6 +295,100 @@ defmodule CymphonyElixir.CoreTest do
     end
   end
 
+  describe "after_run for a killed agent task" do
+    # `AgentRunner` runs after_run in an `after` block, which a kill from the
+    # orchestrator skips. The most common way a run ends (the agent moves its
+    # issue to review) therefore never stopped a dev stack started in before_run.
+    setup do
+      root = Path.join(System.tmp_dir!(), "cymphony-killed-after-run-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(root)
+      on_exit(fn -> File.rm_rf(root) end)
+      marker = Path.join(root, "after-run")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: root,
+        tracker_active_states: ["Todo", "In Progress"],
+        tracker_terminal_states: ["Closed"],
+        hook_after_run: "echo \"$(basename \"$PWD\") $CYMPHONY_ISSUE\" >> #{marker}"
+      )
+
+      %{root: root, marker: marker}
+    end
+
+    defp running_state(issue_id, identifier, workspace_path) do
+      agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: identifier,
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: identifier},
+            workspace_path: workspace_path,
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        token_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      {state, agent_pid}
+    end
+
+    defp await_file(path, deadline \\ 5_000) do
+      cond do
+        File.exists?(path) -> File.read!(path)
+        deadline <= 0 -> flunk("#{path} never appeared")
+        true -> wait_then_await_file(path, deadline)
+      end
+    end
+
+    defp wait_then_await_file(path, deadline) do
+      Process.sleep(20)
+      await_file(path, deadline - 20)
+    end
+
+    test "a move out of the active states runs after_run in the workspace", %{root: root, marker: marker} do
+      workspace = Path.join(root, "MT-601")
+      File.mkdir_p!(workspace)
+      {state, agent_pid} = running_state("issue-601", "MT-601", workspace)
+
+      issue = %Issue{id: "issue-601", identifier: "MT-601", state: "Review", title: "t", labels: []}
+      updated = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      refute Map.has_key?(updated.running, "issue-601")
+      refute Process.alive?(agent_pid)
+      assert await_file(marker) == "MT-601 MT-601\n"
+      assert File.exists?(workspace)
+    end
+
+    test "a terminal state does not run after_run: the workspace is being removed", %{root: root, marker: marker} do
+      workspace = Path.join(root, "MT-602")
+      File.mkdir_p!(workspace)
+      {state, _agent_pid} = running_state("issue-602", "MT-602", workspace)
+
+      issue = %Issue{id: "issue-602", identifier: "MT-602", state: "Closed", title: "t", labels: []}
+      Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      Process.sleep(200)
+      refute File.exists?(marker)
+      refute File.exists?(workspace)
+    end
+
+    test "a task killed before it had a workspace has nothing to undo", %{marker: marker} do
+      {state, agent_pid} = running_state("issue-603", "MT-603", nil)
+
+      issue = %Issue{id: "issue-603", identifier: "MT-603", state: "Review", title: "t", labels: []}
+      Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      refute Process.alive?(agent_pid)
+      Process.sleep(200)
+      refute File.exists?(marker)
+    end
+  end
+
   test "terminal issue state stops running agent and cleans workspace" do
     test_root =
       Path.join(

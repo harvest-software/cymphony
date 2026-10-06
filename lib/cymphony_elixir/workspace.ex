@@ -303,24 +303,90 @@ defmodule CymphonyElixir.Workspace do
         :ok
 
       command ->
-        run_hook(command, workspace, issue_context, "before_run", worker_host, config)
+        with_run_hook_lock(workspace, worker_host, fn ->
+          run_hook(command, workspace, issue_context, "before_run", worker_host, config)
+        end)
     end
   end
 
   @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) :: :ok
   def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ []) when is_binary(workspace) do
     config = Keyword.get(opts, :config)
-    issue_context = issue_context(issue_or_identifier, config)
-    hooks = hooks_config(config)
 
-    case hooks.after_run do
+    case hooks_config(config).after_run do
       nil ->
         :ok
 
       command ->
-        run_hook(command, workspace, issue_context, "after_run", worker_host, config)
-        |> ignore_hook_failure()
+        with_run_hook_lock(workspace, worker_host, fn ->
+          do_run_after_run_hook(command, workspace, issue_or_identifier, worker_host, config)
+        end)
     end
+  end
+
+  @doc """
+  Runs `after_run` for an attempt whose task was killed from outside.
+
+  `AgentRunner` runs `after_run` in an `after` block, which does not run when
+  the orchestrator kills the task (the issue left the active states, a stall,
+  a dashboard Kill or restart). The orchestrator calls this instead, right
+  after the kill.
+
+  The hook runs in its own task and holds the workspace's run-hook lock, which
+  `before_run` also takes. This call returns once the lock is held, so a
+  retry or restart dispatched straight afterwards waits in `before_run` for
+  this `after_run` to finish. Without that, a slow `after_run` (stopping a dev
+  stack) could land after the next attempt's `before_run` and undo it. Gives
+  up waiting after `:lock_wait_ms` (default 2000) and returns `:timeout`; the
+  hook still runs.
+  """
+  @spec run_after_run_hook_detached(Path.t(), map() | String.t() | nil, worker_host(), keyword()) ::
+          :ok | :timeout
+  def run_after_run_hook_detached(workspace, issue_or_identifier, worker_host \\ nil, opts \\ [])
+      when is_binary(workspace) do
+    config = Keyword.get(opts, :config)
+
+    case hooks_config(config).after_run do
+      nil ->
+        :ok
+
+      command ->
+        ref = start_locked_after_run(command, workspace, issue_or_identifier, worker_host, config)
+
+        receive do
+          {:after_run_hook_locked, ^ref} -> :ok
+        after
+          Keyword.get(opts, :lock_wait_ms, 2_000) -> :timeout
+        end
+    end
+  end
+
+  defp start_locked_after_run(command, workspace, issue_or_identifier, worker_host, config) do
+    caller = self()
+    ref = make_ref()
+
+    {:ok, _pid} =
+      Task.Supervisor.start_child(CymphonyElixir.TaskSupervisor, fn ->
+        with_run_hook_lock(workspace, worker_host, fn ->
+          send(caller, {:after_run_hook_locked, ref})
+          do_run_after_run_hook(command, workspace, issue_or_identifier, worker_host, config)
+        end)
+      end)
+
+    ref
+  end
+
+  defp do_run_after_run_hook(command, workspace, issue_or_identifier, worker_host, config) do
+    issue_context = issue_context(issue_or_identifier, config)
+
+    run_hook(command, workspace, issue_context, "after_run", worker_host, config)
+    |> ignore_hook_failure()
+  end
+
+  # `before_run` and `after_run` for one workspace never overlap. A held lock
+  # is released when its owner exits, so a task killed mid-hook cannot wedge it.
+  defp with_run_hook_lock(workspace, worker_host, fun) do
+    :global.trans({{:cymphony_run_hook, worker_host || :local, workspace}, self()}, fun, [Node.self()], :infinity)
   end
 
   defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do

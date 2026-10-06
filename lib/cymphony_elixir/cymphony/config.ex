@@ -1268,14 +1268,86 @@ defmodule CymphonyElixir.Cymphony.Config do
   end
 
   defp maybe_put_hooks(base, config) do
+    clone = clone_hook(config)
+    operator = operator_hooks(config)
+
+    hooks =
+      operator
+      |> Map.delete("after_create")
+      |> maybe_put_after_create(clone, Map.get(operator, "after_create"))
+
+    if hooks == %{}, do: base, else: Map.put(base, "hooks", hooks)
+  end
+
+  defp clone_hook(config) do
     case repo_url(config) do
       "" ->
-        base
+        nil
 
       repo ->
         clone_url = if rewrite_ssh_remote?(config), do: https_clone_url(repo), else: repo
-        Map.put(base, "hooks", %{"after_create" => clone_command(clone_url)})
+        clone_command(clone_url)
     end
+  end
+
+  # An operator `after_create` runs *after* the generated clone and only when
+  # the clone succeeded: it is there to prepare a checkout, and there is no
+  # checkout to prepare until the clone has populated the workspace.
+  defp maybe_put_after_create(hooks, nil, nil), do: hooks
+  defp maybe_put_after_create(hooks, clone, nil), do: Map.put(hooks, "after_create", clone)
+  defp maybe_put_after_create(hooks, nil, extra), do: Map.put(hooks, "after_create", extra)
+
+  defp maybe_put_after_create(hooks, clone, extra) do
+    Map.put(hooks, "after_create", "{\n#{clone}} && {\n#{extra}\n}\n")
+  end
+
+  @hook_commands ~w(after_create before_run after_run before_remove)
+
+  # `hooks` on a `projects[]` entry, hand-edited like `extra_args`:
+  #
+  #   "hooks": {"before_run": "bash scripts/agent-stack.sh prepare",
+  #             "before_remove": "bash scripts/agent-stack.sh remove",
+  #             "timeout_ms": 600000}
+  #
+  # Commands must be non-blank strings and `timeout_ms` a positive integer.
+  # Anything else — including an unknown key — is dropped and warned about: a
+  # mistyped hook otherwise never runs and nothing says why, and an invalid
+  # value written into the front matter would fail `Schema.parse/1` and take
+  # the project down.
+  defp operator_hooks(config) do
+    case Map.get(config, "hooks") do
+      nil ->
+        %{}
+
+      hooks when is_map(hooks) ->
+        Enum.reduce(hooks, %{}, fn {key, value}, acc -> put_operator_hook(acc, key, value) end)
+
+      other ->
+        Logger.warning("Ignoring invalid hooks in config.json: expected an object, got #{inspect(other)}")
+        %{}
+    end
+  end
+
+  defp put_operator_hook(acc, key, value) when key in @hook_commands do
+    if is_binary(value) and String.trim(value) != "" do
+      Map.put(acc, key, value)
+    else
+      warn_invalid_hook(key, value)
+      acc
+    end
+  end
+
+  defp put_operator_hook(acc, "timeout_ms", value) when is_integer(value) and value > 0 do
+    Map.put(acc, "timeout_ms", value)
+  end
+
+  defp put_operator_hook(acc, key, value) do
+    warn_invalid_hook(key, value)
+    acc
+  end
+
+  defp warn_invalid_hook(key, value) do
+    Logger.warning("Ignoring invalid hooks.#{key} in config.json: #{inspect(value)}")
   end
 
   # The base branch is per *issue* (an issue branches off its parent's branch)

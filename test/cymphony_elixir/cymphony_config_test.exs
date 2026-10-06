@@ -377,6 +377,80 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
       refute Map.has_key?(CymphonyConfig.to_schema_map(%{"github_repo_url" => 1}), "hooks")
     end
 
+    test "operator hooks pass through next to the generated clone" do
+      config = %{
+        "repo_url" => "https://gitlab.example.com/group/repo.git",
+        "hooks" => %{
+          "before_run" => "bash scripts/agent-stack.sh prepare",
+          "after_run" => "./build.sh down",
+          "before_remove" => "bash scripts/agent-stack.sh remove",
+          "timeout_ms" => 600_000
+        }
+      }
+
+      hooks = CymphonyConfig.to_schema_map(config)["hooks"]
+
+      assert hooks["after_create"] =~ "git clone --depth 1 https://gitlab.example.com/group/repo.git ."
+      assert hooks["before_run"] == "bash scripts/agent-stack.sh prepare"
+      assert hooks["after_run"] == "./build.sh down"
+      assert hooks["before_remove"] == "bash scripts/agent-stack.sh remove"
+      assert hooks["timeout_ms"] == 600_000
+
+      assert {:ok, settings} = Schema.parse(CymphonyConfig.to_schema_map(config))
+      assert settings.hooks.before_run == "bash scripts/agent-stack.sh prepare"
+      assert settings.hooks.timeout_ms == 600_000
+    end
+
+    test "an operator after_create runs after the clone, and only when it succeeded" do
+      hooks =
+        CymphonyConfig.to_schema_map(%{
+          "repo_url" => "https://gitlab.example.com/group/repo.git",
+          "hooks" => %{"after_create" => "touch prepared"}
+        })["hooks"]
+
+      {clone_at, _} = :binary.match(hooks["after_create"], "git clone")
+      {extra_at, _} = :binary.match(hooks["after_create"], "touch prepared")
+      assert clone_at < extra_at
+      assert hooks["after_create"] =~ "} && {"
+      assert {_, 0} = System.cmd("sh", ["-n", "-c", hooks["after_create"]])
+
+      # Without a repo there is no clone to chain onto.
+      assert CymphonyConfig.to_schema_map(%{"hooks" => %{"after_create" => "touch prepared"}})["hooks"] ==
+               %{"after_create" => "touch prepared"}
+    end
+
+    test "invalid operator hooks are dropped and warned about" do
+      for {key, value} <- [
+            {"before_run", ""},
+            {"before_run", "   "},
+            {"after_run", ["./build.sh", "down"]},
+            {"before_remove", 1},
+            {"timeout_ms", 0},
+            {"timeout_ms", "600000"},
+            {"before_rnu", "typo"}
+          ] do
+        log =
+          capture_log(fn ->
+            refute Map.has_key?(CymphonyConfig.to_schema_map(%{"hooks" => %{key => value}}), "hooks")
+          end)
+
+        assert log =~ "Ignoring invalid hooks.#{key} in config.json"
+      end
+
+      log = capture_log(fn -> refute Map.has_key?(CymphonyConfig.to_schema_map(%{"hooks" => "x"}), "hooks") end)
+      assert log =~ "Ignoring invalid hooks in config.json"
+
+      # A bad operator hook never costs the project its clone.
+      log =
+        capture_log(fn ->
+          hooks = CymphonyConfig.to_schema_map(%{"repo_url" => "https://github.com/me/repo.git", "hooks" => %{"after_create" => ""}})["hooks"]
+          assert hooks["after_create"] =~ "git clone --depth 1 https://github.com/me/repo.git ."
+          refute hooks["after_create"] =~ "&&"
+        end)
+
+      assert log =~ "hooks.after_create"
+    end
+
     test "a repo URL that is not an scp-style git@ remote is cloned verbatim" do
       https = CymphonyConfig.to_schema_map(%{"github_repo_url" => "  https://github.com/me/repo.git  "})
       assert https["hooks"]["after_create"] =~ "git clone --depth 1 https://github.com/me/repo.git ."
