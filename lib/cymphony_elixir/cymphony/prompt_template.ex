@@ -55,6 +55,13 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
   the normal case for the first sub-task of a new parent issue and is not a
   blocker.
 
+  ## Commits
+
+  Prefix every commit subject with `{{ branch_name }}` followed by a space, then
+  the summary — for example `{{ branch_name }} Add OAUTH_* environment
+  configuration and a fail-closed validator`. Every commit on this branch, not
+  just the first. Do not repeat the prefix if the subject already starts with it.
+
   ## Prerequisite: {{ tracker.name }} access
 
   You must be able to read and write the ticket through {{ tracker.access }}. If that is not available, stop and report it as a blocker.
@@ -81,7 +88,9 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
 
   ## Related skills
 
-  - `commit`: produce clean, logical commits during implementation.
+  - `commit`: produce clean, logical commits during implementation. If the skill's
+    own message format conflicts with the `{{ branch_name }}` prefix above, keep
+    the prefix and apply the skill's format after it.
   - `push`: keep remote branch current and publish updates.
   - `pull`: keep branch updated with latest `origin/{{ base_branch }}` before handoff.
   {% if workflow.merge_state %}  - `land`: when ticket reaches `{{ workflow.merge_state }}`, explicitly open and follow `.claude/skills/land/SKILL.md`, which includes the `land` loop.

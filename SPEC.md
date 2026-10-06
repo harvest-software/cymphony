@@ -444,6 +444,11 @@ Note:
 - The rendered value is sanitized into a legal git ref (whitespace to `-`, ref-forbidden
   characters dropped, edges trimmed). A template that renders blank or fails falls back to the
   issue identifier and logs a warning.
+- The same rendered value prefixes **every commit subject** on the branch, followed by a
+  space and then the summary (`HFE-6473 Add OAUTH_* environment configuration and a
+  fail-closed validator`). It is the rendered branch name, not the bare identifier, so a
+  prefixed template carries into the commit subject too. Where a repository's own `commit`
+  skill prescribes a different message shape, the prefix goes first and that shape follows.
 
 #### 5.3.0.2 `base_branch` (string)
 

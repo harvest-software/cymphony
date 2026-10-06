@@ -59,6 +59,25 @@ defmodule CymphonyElixir.PromptBranchTest do
     assert prompt =~ "Create a fresh branch named exactly `HC-1`"
   end
 
+  test "every commit is prefixed with the branch name" do
+    {:ok, config} = Schema.parse(%{"branch_name_template" => "{{ issue.identifier }}"})
+
+    prompt = PromptBuilder.build_prompt(issue(), prompt_template: PromptTemplate.get(), config: config)
+
+    assert prompt =~ "Prefix every commit subject with `HC-1` followed by a space"
+    assert prompt =~ "`HC-1 Add OAUTH_* environment"
+    # The `commit` skill has its own opinion about message shape; the prefix wins.
+    assert prompt =~ "keep\n  the prefix and apply the skill's format after it"
+  end
+
+  test "the commit prefix follows branch_name_template, not the bare identifier" do
+    {:ok, config} = Schema.parse(%{"branch_name_template" => "feature/{{ issue.identifier }}"})
+
+    prompt = PromptBuilder.build_prompt(issue(), prompt_template: PromptTemplate.get(), config: config)
+
+    assert prompt =~ "Prefix every commit subject with `feature/HC-1` followed by a space"
+  end
+
   describe "base_branch/2" do
     test "an issue with no parent uses the configured base branch" do
       {:ok, default} = Schema.parse(%{})

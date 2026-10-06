@@ -783,6 +783,11 @@ credentials — it changes what the agent is *told to do*.
   sanitized into a legal git ref (`sanitize_branch/1`) and a template that renders
   blank or raises falls back to the identifier with a warning — a typo in an
   operator template must not take the run down.
+- **Every commit subject is prefixed with the branch name.** The `## Commits` section of
+  the prompt renders `{{ branch_name }}` — the same rendered value the branch itself gets,
+  so `feature/{{ issue.identifier }}` prefixes commits with `feature/HC-1`, not `HC-1`.
+  The `Related skills` entry for the `commit` skill says the prefix wins over the skill's
+  own message format, because a target repository's skill has no idea the ticket exists.
 - Resolution is `opts[:forge]` → `config.forge` → `github`. An unrecognized
   value is logged and falls back at both layers (`Schema.Forge`, a lenient
   Ecto type like `LenientBoolean`, and `Cymphony.Config.forge/1`) rather than
