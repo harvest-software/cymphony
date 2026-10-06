@@ -62,6 +62,52 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
   configuration and a fail-closed validator`. Every commit on this branch, not
   just the first. Do not repeat the prefix if the subject already starts with it.
 
+  ## Testing
+
+  Test close to the change while you work, and do one broad run near the end.
+  A repository skill that names its test commands decides what "close to the
+  change" and "broad" mean for that repository. Follow it.
+
+  - **While iterating:** run only the tests for the code you touched, and the
+    tests next to it. After each edit, rerun only what that edit could affect.
+    This is the validation required before an intermediate `git push`.
+  - **Once, near the end:** after the last code change and the merge of
+    `origin/{{ base_branch }}`, run the broad suite once. If it finds a problem,
+    fix it, go back to targeted tests, and then rerun only the parts of the
+    broad run that failed. Never repeat the whole broad run.
+  - **Pre-existing failures:** if a test fails in code your change does not
+    touch, rerun only that test against the base (for example, stash your
+    change and use a filter). Do not rerun a whole suite to collect a baseline.
+    Record confirmed pre-existing failures in the workpad `Validation` section
+    and move on.
+  - **Capture output once:** write each run's output to a file (a JUnit report
+    or `tee`) and read the file. Never rerun a suite just to view its output
+    another way.
+  - **Wait in the foreground:** run long test commands in the foreground with
+    an explicit timeout, and split a run that would exceed it into several
+    commands. Never start a test run in the background and end your turn to
+    wait for it. Ending the turn does not wait; it starts another turn.
+
+  ## Working efficiently
+
+  Everything you read stays in context and is re-sent on every later step, so
+  read narrowly.
+
+  - **Locate, then read a range:** find what you need with `grep -n` (or the
+    Grep tool), then read only the surrounding lines (`sed -n 'START,ENDp'`, or
+    Read with an offset and limit). Read a whole file only when you need all of
+    it, and never `cat` several whole files in one command.
+  - **Bound searches:** scope `grep`/`find` to the relevant directories, exclude
+    `vendor` and `node_modules`, and use `-l` or `| head` when you only need to
+    know where something is.
+  - **Delegate broad reconnaissance:** when understanding a subsystem means
+    sweeping many files, hand it to an Explore subagent and ask for a summary
+    with file:line references, then read only the lines you will change.
+  - **Do not re-read:** do not read a file again unless it changed, and inspect
+    diffs with `git diff --stat` before reading the full diff.
+  - **Keep command output short:** filter long output (`tail`, `grep`) instead
+    of printing it in full.
+
   ## Prerequisite: {{ tracker.name }} access
 
   You must be able to read and write the ticket through {{ tracker.access }}. If that is not available, stop and report it as a blocker.
@@ -152,7 +198,7 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
   7. For comments such as "please fix merge conflicts on {{ forge.review_abbr }}":
      - Identify the attached/open {{ forge.review_abbr }}.
      - Check out the {{ forge.review_abbr }} branch.
-     - Fetch latest `origin/{{ base_branch }}`, merge it into the {{ forge.review_abbr }} branch, resolve conflicts, and rerun required validation.
+     - Fetch latest `origin/{{ base_branch }}`, merge it into the {{ forge.review_abbr }} branch, resolve conflicts, and run the targeted tests for the code the conflicts touched, plus the broad run once before handoff (see `## Testing`).
      - Push the resolved branch to the existing {{ forge.review_abbr }}.
      - Run the {{ forge.review_abbr }} feedback sweep and checks gate before handoff.
   8. If there are no actionable new human comments and the existing {{ forge.review_abbr }} is healthy, update the workpad checkpoint and return the issue to `{{ workflow.review_state }}`.
@@ -202,7 +248,7 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
      - code/test/docs updated to address it, or
      - explicit, justified pushback reply is posted on that thread.
   4. Update the workpad plan/checklist to include each feedback item and its resolution status.
-  5. Re-run validation after feedback-driven changes and push updates.
+  5. Run the targeted tests for the feedback-driven changes and push updates. Do not repeat the broad run unless the changes reach beyond the code they address.
   6. Repeat this sweep until there are no outstanding actionable comments.
 
   ## Blocked-access escape hatch (required behavior)
@@ -230,15 +276,14 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
       - Update the workpad immediately after each meaningful milestone (for example: reproduction complete, code change landed, validation run, review feedback addressed).
       - Never leave completed work unchecked in the plan.
       - For tickets that started as a queued state with an attached {{ forge.review_abbr }}, run the full {{ forge.review_abbr }} feedback sweep protocol immediately after kickoff and before new feature work.
-  5.  Run validation/tests required for the scope.
+  5.  Run the targeted tests for the change (see `## Testing`). The broad run happens once, in step 11.
       - Mandatory gate: execute all ticket-provided `Validation`/`Test Plan`/ `Testing` requirements when present; treat unmet items as incomplete work.
       - Prefer a targeted proof that directly demonstrates the behavior you changed.
       - You may make temporary local proof edits to validate assumptions (for example: tweak a local build input for `make`, or hardcode a UI account / response path) when this increases confidence.
       - Revert every temporary proof edit before commit/push.
       - Document these temporary proof steps and outcomes in the workpad `Validation`/`Notes` sections so reviewers can follow the evidence.
-      - If app-touching, run `launch-app` validation and capture/upload media via the review-media skill before handoff.
   6.  Re-check all acceptance criteria and close any gaps.
-  7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
+  7.  Before every `git push` attempt, run the targeted tests for what changed since the last push and confirm they pass; if they fail, address issues and rerun until green, then commit and push changes. Do not run the broad suite here.
   8.  Open the {{ forge.review_abbr }} if one is not already attached, naming the base explicitly:
       `{{ forge.cli }} {{ forge.review_open_command }} {{ forge.review_base_flag }} {{ base_branch }}{% if forge.review_squash_flag %} {{ forge.review_squash_flag }}{% endif %}`.
       - Never omit `{{ forge.review_base_flag }}`. Without it {{ forge.cli }} targets the repository default branch, which is not the base for this issue.
@@ -250,7 +295,7 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
   {% if forge.review_squash_flag %}    - Read the squash setting back with `{{ forge.review_squash_check_command }}`; if it is not enabled, enable it with `{{ forge.review_squash_command }}`. An {{ forge.review_abbr }} opened by an earlier run predates this rule.
   {% endif %}10. Attach {{ forge.review_abbr }} URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
       - Ensure the {{ forge.name }} {{ forge.review_abbr }} has label `cymphony` (add it if missing).
-  11. Merge latest `origin/{{ base_branch }}` into branch, resolve conflicts, and rerun checks.
+  11. Merge latest `origin/{{ base_branch }}` into branch and resolve conflicts, then do the one broad test run (see `## Testing`). Fix what it finds, rerun only the parts that failed, and push.
   12. Update the workpad comment with final checklist status and validation notes.
       - Mark completed plan/acceptance/validation checklist items as checked.
       - Add final handoff notes (commit + validation summary) in the same workpad comment.
@@ -297,7 +342,7 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
 
   - Step 1/2 checklist is fully complete and accurately reflected in the single workpad comment.
   - Acceptance criteria and required ticket-provided validation items are complete.
-  - Validation/tests are green for the latest commit.
+  - Targeted tests are green for the latest commit, and the broad run passed after the final merge of `origin/{{ base_branch }}`, with any pre-existing failures recorded in the workpad.
   - {{ forge.review_abbr }} feedback sweep is complete and no actionable comments remain.
   - {{ forge.review_abbr }} checks are green, branch is pushed, and {{ forge.review_abbr }} is linked on the issue.
   - Required {{ forge.review_abbr }} metadata is present (`cymphony` label).
@@ -349,6 +394,8 @@ defmodule CymphonyElixir.Cymphony.PromptTemplate do
   ### Validation
 
   - [ ] targeted tests: `<command>`
+  - [ ] broad run (once, before review): `<command>`
+  - pre-existing failures: <test, and how it was confirmed against the base>
 
   ### Notes
 
