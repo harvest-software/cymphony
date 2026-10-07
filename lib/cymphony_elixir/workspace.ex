@@ -4,6 +4,7 @@ defmodule CymphonyElixir.Workspace do
   """
 
   require Logger
+  alias CymphonyElixir.Agent.PortGuard
   alias CymphonyElixir.{Config, PathSafety, PromptBuilder, SSH}
 
   @remote_workspace_marker "__CYMPHONY_WORKSPACE__"
@@ -23,18 +24,19 @@ defmodule CymphonyElixir.Workspace do
 
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host, config),
            :ok <- validate_workspace_path(workspace, worker_host, config),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
-           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host, config) do
+           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host, config, opts),
+           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host, config, opts) do
         {:ok, workspace}
       end
     rescue
       error in [ArgumentError, ErlangError, File.Error] ->
         Logger.error("Workspace creation failed #{issue_log_context(issue_context)} worker_host=#{worker_host_for_log(worker_host)} error=#{Exception.message(error)}")
+
         {:error, error}
     end
   end
 
-  defp ensure_workspace(workspace, nil) do
+  defp ensure_workspace(workspace, nil, _config, _opts) do
     cond do
       File.dir?(workspace) and workspace_needs_bootstrap?(workspace) ->
         {:ok, workspace, true}
@@ -51,11 +53,10 @@ defmodule CymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, worker_host) when is_binary(worker_host) do
+  defp ensure_workspace(workspace, worker_host, config, opts) when is_binary(worker_host) do
     script =
       [
-        "set -eu",
-        remote_shell_assign("workspace", workspace),
+        remote_guard_script(workspace, config),
         "if [ -d \"$workspace\" ]; then",
         "  created=0",
         "elif [ -e \"$workspace\" ]; then",
@@ -72,7 +73,7 @@ defmodule CymphonyElixir.Workspace do
       |> Enum.reject(&(&1 == ""))
       |> Enum.join("\n")
 
-    case run_remote_command(worker_host, script, hooks_config().timeout_ms) do
+    case run_remote_command(worker_host, script, hooks_config(config).timeout_ms, opts) do
       {:ok, {output, 0}} ->
         parse_remote_workspace_output(output)
 
@@ -107,15 +108,20 @@ defmodule CymphonyElixir.Workspace do
   defp bootstrap_placeholder?(_name), do: false
 
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove(workspace), do: remove(workspace, nil)
+  def remove(workspace), do: remove(workspace, nil, [])
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove(workspace, nil) do
+  def remove(workspace, worker_host), do: remove(workspace, worker_host, [])
+
+  @spec remove(Path.t(), worker_host(), keyword()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove(workspace, nil, opts) do
+    config = Keyword.get(opts, :config)
+
     case File.exists?(workspace) do
       true ->
-        case validate_workspace_path(workspace, nil) do
+        case validate_workspace_path(workspace, nil, config) do
           :ok ->
-            maybe_run_before_remove_hook(workspace, nil)
+            maybe_run_before_remove_hook(workspace, nil, config, opts)
             File.rm_rf(workspace)
 
           {:error, reason} ->
@@ -127,31 +133,36 @@ defmodule CymphonyElixir.Workspace do
     end
   end
 
-  def remove(workspace, worker_host) when is_binary(worker_host) do
-    maybe_run_before_remove_hook(workspace, worker_host)
+  def remove(workspace, worker_host, opts) when is_binary(worker_host) do
+    config = Keyword.get(opts, :config)
 
     script =
       [
-        remote_shell_assign("workspace", workspace),
+        remote_guard_script(workspace, config),
         "rm -rf \"$workspace\""
       ]
       |> Enum.join("\n")
 
-    case run_remote_command(worker_host, script, hooks_config().timeout_ms) do
-      {:ok, {_output, 0}} ->
-        {:ok, []}
+    with :ok <- validate_remote_workspace(workspace, worker_host, config, false, opts),
+         :ok <- maybe_run_before_remove_hook(workspace, worker_host, config, opts) do
+      case run_remote_command(worker_host, script, hooks_config(config).timeout_ms, opts) do
+        {:ok, {_output, 0}} ->
+          {:ok, []}
 
-      {:ok, {output, status}} ->
-        {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+        {:ok, {output, status}} ->
+          {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
 
-      {:error, reason} ->
-        {:error, reason, ""}
+        {:error, reason} ->
+          {:error, reason, ""}
+      end
+    else
+      {:error, reason} -> {:error, reason, ""}
     end
   end
 
   @doc """
   Sweeps `workspace_root` for top-level directories whose last-modified time is older than
-  `:days`. Skips paths in `:exclude_paths` (e.g. currently-running workspaces).
+  `:days`. Skips paths in `:exclude_paths` and their sibling session logs.
 
   Returns `{:ok, removed}` after deletion, or `{:dry_run, would_remove}` when `dry_run: true`.
   Both `removed` and `would_remove` are lists of absolute paths.
@@ -162,13 +173,28 @@ defmodule CymphonyElixir.Workspace do
   def clean_stale(workspace_root, opts) when is_binary(workspace_root) do
     days = Keyword.fetch!(opts, :days)
     dry_run = Keyword.get(opts, :dry_run, false)
-    exclude = Keyword.get(opts, :exclude_paths, []) |> MapSet.new()
+
+    # Runtime metadata uses physical paths; the configured root may name a
+    # symlink (for example /var on macOS). Compare canonical identities.
+    exclude =
+      opts
+      |> Keyword.get(:exclude_paths, [])
+      |> Enum.flat_map(fn path -> [path, Path.join(Path.dirname(path), @session_log_prefix <> Path.basename(path) <> ".log")] end)
+      |> MapSet.new(&PathSafety.canonicalize/1)
 
     cutoff = DateTime.utc_now() |> DateTime.add(-days * 86_400, :second)
 
     case File.ls(workspace_root) do
       {:ok, entries} ->
-        finish_clean_stale(workspace_root, entries, exclude, cutoff, dry_run)
+        finish_clean_stale(
+          workspace_root,
+          entries,
+          exclude,
+          cutoff,
+          dry_run,
+          Keyword.get(opts, :config),
+          opts
+        )
 
       {:error, :enoent} ->
         empty_clean_stale_result(dry_run)
@@ -181,15 +207,15 @@ defmodule CymphonyElixir.Workspace do
   defp empty_clean_stale_result(true), do: {:dry_run, []}
   defp empty_clean_stale_result(false), do: {:ok, []}
 
-  defp finish_clean_stale(workspace_root, entries, exclude, cutoff, true) do
+  defp finish_clean_stale(workspace_root, entries, exclude, cutoff, true, _config, _opts) do
     {:dry_run, stale_candidates(workspace_root, entries, exclude, cutoff)}
   end
 
-  defp finish_clean_stale(workspace_root, entries, exclude, cutoff, false) do
+  defp finish_clean_stale(workspace_root, entries, exclude, cutoff, false, config, opts) do
     removed =
       workspace_root
       |> stale_candidates(entries, exclude, cutoff)
-      |> Enum.flat_map(&remove_stale_path(&1, workspace_root))
+      |> Enum.flat_map(&remove_stale_path(&1, workspace_root, config, opts))
 
     {:ok, removed}
   end
@@ -201,7 +227,7 @@ defmodule CymphonyElixir.Workspace do
   end
 
   defp stale_candidate?(path, exclude, cutoff) do
-    sweepable?(path) and not MapSet.member?(exclude, path) and stale?(path, cutoff)
+    sweepable?(path) and not MapSet.member?(exclude, PathSafety.canonicalize(path)) and stale?(path, cutoff)
   end
 
   # Directories are the workspaces themselves. The one plain file the sweep also
@@ -218,21 +244,24 @@ defmodule CymphonyElixir.Workspace do
     String.starts_with?(name, @session_log_prefix) and String.ends_with?(name, ".log")
   end
 
-  defp remove_stale_path(path, workspace_root) do
+  defp remove_stale_path(path, workspace_root, config, opts) do
     # Sanity-check: refuse to delete anything that isn't a direct child of workspace_root.
     # (Defense in depth — Path.join above already enforces this.)
-    if Path.dirname(path) == Path.expand(workspace_root) do
-      delete_stale_workspace(path)
+    sweep_root = %{workspace: %{root: workspace_root}}
+
+    if Path.dirname(path) == Path.expand(workspace_root) and
+         validate_workspace_path(path, nil, sweep_root) == :ok do
+      delete_stale_workspace(path, config, opts)
     else
       Logger.warning("Workspace cleanup refused for #{path}: not a direct child of #{workspace_root}")
       []
     end
   end
 
-  defp delete_stale_workspace(path) do
+  defp delete_stale_workspace(path, config, opts) do
     # The sibling session log is not a workspace, so it gets no `before_remove`
     # hook — the hook runs shell in a workspace directory.
-    if not session_log?(path), do: maybe_run_before_remove_hook(path, nil)
+    if not session_log?(path), do: maybe_run_before_remove_hook(path, nil, config, opts)
 
     case File.rm_rf(path) do
       {:ok, _} ->
@@ -256,44 +285,52 @@ defmodule CymphonyElixir.Workspace do
   end
 
   @spec remove_issue_workspaces(term()) :: :ok
-  def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil)
+  def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil, [])
 
   @spec remove_issue_workspaces(term(), worker_host()) :: :ok
-  def remove_issue_workspaces(identifier, worker_host) when is_binary(identifier) and is_binary(worker_host) do
-    safe_id = safe_identifier(identifier)
+  def remove_issue_workspaces(identifier, worker_host),
+    do: remove_issue_workspaces(identifier, worker_host, [])
 
-    case workspace_path_for_issue(safe_id, worker_host) do
-      {:ok, workspace} -> remove(workspace, worker_host)
+  @spec remove_issue_workspaces(term(), worker_host(), keyword()) :: :ok
+  def remove_issue_workspaces(identifier, worker_host, opts)
+      when is_binary(identifier) and is_binary(worker_host) do
+    safe_id = safe_identifier(identifier)
+    config = Keyword.get(opts, :config)
+
+    case workspace_path_for_issue(safe_id, worker_host, config) do
+      {:ok, workspace} -> remove(workspace, worker_host, opts)
       {:error, _reason} -> :ok
     end
 
     :ok
   end
 
-  def remove_issue_workspaces(identifier, nil) when is_binary(identifier) do
+  def remove_issue_workspaces(identifier, nil, opts) when is_binary(identifier) do
     safe_id = safe_identifier(identifier)
+    config = Keyword.get(opts, :config)
 
-    case worker_config().ssh_hosts do
+    case worker_config(config).ssh_hosts do
       [] ->
-        case workspace_path_for_issue(safe_id, nil) do
-          {:ok, workspace} -> remove(workspace, nil)
+        case workspace_path_for_issue(safe_id, nil, config) do
+          {:ok, workspace} -> remove(workspace, nil, opts)
           {:error, _reason} -> :ok
         end
 
       worker_hosts ->
-        Enum.each(worker_hosts, &remove_issue_workspaces(identifier, &1))
+        Enum.each(worker_hosts, &remove_issue_workspaces(identifier, &1, opts))
     end
 
     :ok
   end
 
-  def remove_issue_workspaces(_identifier, _worker_host) do
+  def remove_issue_workspaces(_identifier, _worker_host, _opts) do
     :ok
   end
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) ::
           :ok | {:error, term()}
-  def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ []) when is_binary(workspace) do
+  def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ [])
+      when is_binary(workspace) do
     config = Keyword.get(opts, :config)
     issue_context = issue_context(issue_or_identifier, config)
     hooks = hooks_config(config)
@@ -304,13 +341,14 @@ defmodule CymphonyElixir.Workspace do
 
       command ->
         with_run_hook_lock(workspace, worker_host, fn ->
-          run_hook(command, workspace, issue_context, "before_run", worker_host, config)
+          run_hook(command, workspace, issue_context, "before_run", worker_host, config, opts)
         end)
     end
   end
 
   @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) :: :ok
-  def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ []) when is_binary(workspace) do
+  def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ [])
+      when is_binary(workspace) do
     config = Keyword.get(opts, :config)
 
     case hooks_config(config).after_run do
@@ -319,7 +357,7 @@ defmodule CymphonyElixir.Workspace do
 
       command ->
         with_run_hook_lock(workspace, worker_host, fn ->
-          do_run_after_run_hook(command, workspace, issue_or_identifier, worker_host, config)
+          do_run_after_run_hook(command, workspace, issue_or_identifier, worker_host, config, opts)
         end)
     end
   end
@@ -351,7 +389,7 @@ defmodule CymphonyElixir.Workspace do
         :ok
 
       command ->
-        ref = start_locked_after_run(command, workspace, issue_or_identifier, worker_host, config)
+        ref = start_locked_after_run(command, workspace, issue_or_identifier, worker_host, config, opts)
 
         receive do
           {:after_run_hook_locked, ^ref} -> :ok
@@ -361,7 +399,7 @@ defmodule CymphonyElixir.Workspace do
     end
   end
 
-  defp start_locked_after_run(command, workspace, issue_or_identifier, worker_host, config) do
+  defp start_locked_after_run(command, workspace, issue_or_identifier, worker_host, config, opts) do
     caller = self()
     ref = make_ref()
 
@@ -369,17 +407,17 @@ defmodule CymphonyElixir.Workspace do
       Task.Supervisor.start_child(CymphonyElixir.TaskSupervisor, fn ->
         with_run_hook_lock(workspace, worker_host, fn ->
           send(caller, {:after_run_hook_locked, ref})
-          do_run_after_run_hook(command, workspace, issue_or_identifier, worker_host, config)
+          do_run_after_run_hook(command, workspace, issue_or_identifier, worker_host, config, opts)
         end)
       end)
 
     ref
   end
 
-  defp do_run_after_run_hook(command, workspace, issue_or_identifier, worker_host, config) do
+  defp do_run_after_run_hook(command, workspace, issue_or_identifier, worker_host, config, opts) do
     issue_context = issue_context(issue_or_identifier, config)
 
-    run_hook(command, workspace, issue_context, "after_run", worker_host, config)
+    run_hook(command, workspace, issue_context, "after_run", worker_host, config, opts)
     |> ignore_hook_failure()
   end
 
@@ -389,21 +427,14 @@ defmodule CymphonyElixir.Workspace do
     :global.trans({{:cymphony_run_hook, worker_host || :local, workspace}, self()}, fun, [Node.self()], :infinity)
   end
 
-  defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do
-    workspace_path_for_issue(safe_id, nil, nil)
-  end
-
-  defp workspace_path_for_issue(safe_id, worker_host) when is_binary(safe_id) and is_binary(worker_host) do
-    workspace_path_for_issue(safe_id, worker_host, nil)
-  end
-
   defp workspace_path_for_issue(safe_id, nil, config) when is_binary(safe_id) do
     workspace_root(config)
     |> Path.join(safe_id)
     |> PathSafety.canonicalize()
   end
 
-  defp workspace_path_for_issue(safe_id, worker_host, config) when is_binary(safe_id) and is_binary(worker_host) do
+  defp workspace_path_for_issue(safe_id, worker_host, config)
+       when is_binary(safe_id) and is_binary(worker_host) do
     {:ok, Path.join(workspace_root(config), safe_id)}
   end
 
@@ -414,26 +445,26 @@ defmodule CymphonyElixir.Workspace do
     String.replace(identifier || "issue", Regex.compile!("[^a-zA-Z0-9._-]"), "_")
   end
 
-  defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host, config) do
+  defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host, config, opts) do
     case created? do
-      true -> run_after_create_hook(workspace, issue_context, worker_host, config)
+      true -> run_after_create_hook(workspace, issue_context, worker_host, config, opts)
       false -> :ok
     end
   end
 
-  defp run_after_create_hook(workspace, issue_context, worker_host, config) do
+  defp run_after_create_hook(workspace, issue_context, worker_host, config, opts) do
     case hooks_config(config).after_create do
       nil ->
         :ok
 
       command ->
-        run_locked_after_create(command, workspace, issue_context, worker_host, config)
+        run_locked_after_create(command, workspace, issue_context, worker_host, config, opts)
     end
   end
 
-  defp run_locked_after_create(command, workspace, issue_context, worker_host, config) do
+  defp run_locked_after_create(command, workspace, issue_context, worker_host, config, opts) do
     with_after_create_lock(config, fn ->
-      run_hook(command, workspace, issue_context, "after_create", worker_host, config)
+      run_hook(command, workspace, issue_context, "after_create", worker_host, config, opts)
     end)
   end
 
@@ -445,15 +476,7 @@ defmodule CymphonyElixir.Workspace do
     :global.trans({:cymphony_after_create, self()}, fun, [Node.self()], :infinity)
   end
 
-  defp maybe_run_before_remove_hook(workspace, nil) do
-    maybe_run_before_remove_hook(workspace, nil, nil)
-  end
-
-  defp maybe_run_before_remove_hook(workspace, worker_host) when is_binary(worker_host) do
-    maybe_run_before_remove_hook(workspace, worker_host, nil)
-  end
-
-  defp maybe_run_before_remove_hook(workspace, nil, config) do
+  defp maybe_run_before_remove_hook(workspace, nil, config, opts) do
     hooks = hooks_config(config)
 
     case File.dir?(workspace) do
@@ -469,7 +492,8 @@ defmodule CymphonyElixir.Workspace do
               %{issue_id: nil, issue_identifier: Path.basename(workspace)},
               "before_remove",
               nil,
-              config
+              config,
+              opts
             )
             |> ignore_hook_failure()
         end
@@ -479,7 +503,7 @@ defmodule CymphonyElixir.Workspace do
     end
   end
 
-  defp maybe_run_before_remove_hook(workspace, worker_host, config) when is_binary(worker_host) do
+  defp maybe_run_before_remove_hook(workspace, worker_host, config, opts) when is_binary(worker_host) do
     hooks = hooks_config(config)
 
     case hooks.before_remove do
@@ -489,7 +513,7 @@ defmodule CymphonyElixir.Workspace do
       command ->
         script =
           [
-            remote_shell_assign("workspace", workspace),
+            remote_guard_script(workspace, config),
             "if [ -d \"$workspace\" ]; then",
             "  cd \"$workspace\"",
             "  #{command}",
@@ -497,7 +521,7 @@ defmodule CymphonyElixir.Workspace do
           ]
           |> Enum.join("\n")
 
-        run_remote_command(worker_host, script, hooks_config(config).timeout_ms)
+        run_remote_command(worker_host, script, hooks_config(config).timeout_ms, opts)
         |> case do
           {:ok, {output, status}} ->
             handle_hook_command_result(
@@ -520,43 +544,59 @@ defmodule CymphonyElixir.Workspace do
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
 
-  defp run_hook(command, workspace, issue_context, hook_name, nil, config) do
+  defp run_hook(command, workspace, issue_context, hook_name, nil, config, opts) do
     timeout_ms = hooks_config(config).timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
-    env = hook_env(issue_context)
+    env =
+      issue_context
+      |> hook_env()
+      |> Enum.map(fn {name, value} -> {String.to_charlist(name), String.to_charlist(value)} end)
 
-    task =
-      Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true, env: env)
-      end)
+    opener = fn ->
+      {:ok,
+       Port.open(
+         {:spawn_executable, System.find_executable("sh") |> String.to_charlist()},
+         [
+           :binary,
+           :exit_status,
+           :stderr_to_stdout,
+           args: [~c"-lc", String.to_charlist(PortGuard.prepare(command))],
+           cd: String.to_charlist(workspace),
+           env: env
+         ]
+       )}
+    end
 
-    case Task.yield(task, timeout_ms) do
+    case PortGuard.run(port_supervisor(opts), opener, timeout_ms, handshake: true) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
-      nil ->
-        Task.shutdown(task, :brutal_kill)
-
+      {:error, :timeout} ->
         Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
 
         {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp run_hook(command, workspace, issue_context, hook_name, worker_host, config) when is_binary(worker_host) do
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host, config, opts)
+       when is_binary(worker_host) do
     timeout_ms = hooks_config(config).timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    remote_command =
+    exports =
       issue_context
       |> hook_env()
       |> Enum.map_join("", fn {name, value} -> "export #{name}=#{shell_escape(value)}\n" end)
-      |> Kernel.<>("cd #{shell_escape(workspace)} && #{command}")
 
-    case run_remote_command(worker_host, remote_command, timeout_ms) do
+    script = exports <> remote_guard_script(workspace, config, true) <> "\ncd \"$workspace\" && #{command}"
+
+    case run_remote_command(worker_host, script, timeout_ms, opts) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -634,8 +674,81 @@ defmodule CymphonyElixir.Workspace do
     end
   end
 
-  defp validate_workspace_path(workspace, nil) when is_binary(workspace) do
-    validate_workspace_path(workspace, nil, nil)
+  @doc false
+  @spec validate_remote_workspace(Path.t(), String.t(), term(), boolean()) :: :ok | {:error, term()}
+  @spec validate_remote_workspace(Path.t(), String.t(), term(), boolean(), keyword()) ::
+          :ok | {:error, term()}
+  def validate_remote_workspace(workspace, worker_host, config, require_existing \\ false, opts \\ [])
+      when is_binary(workspace) and is_binary(worker_host) do
+    case run_remote_command(
+           worker_host,
+           remote_guard_script(workspace, config, require_existing),
+           hooks_config(config).timeout_ms,
+           opts
+         ) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {output, status}} -> {:error, {:invalid_remote_workspace, worker_host, status, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Resolve on the worker itself: local Path.expand/realpath would inspect the
+  # controller's filesystem and could miss a worker-only symlink escape.
+  # Paths beneath a not-yet-created root are resolved from the nearest existing
+  # ancestor; existing symlinks are followed by cd -P. A configured relative
+  # root may itself contain dot segments, but traversal appended after that
+  # root is refused rather than normalized across missing components.
+  @doc false
+  @spec remote_guard_script(Path.t(), term(), boolean()) :: String.t()
+  def remote_guard_script(workspace, config, require_existing \\ false) do
+    [
+      "set -eu",
+      remote_shell_assign("workspace", workspace),
+      remote_shell_assign("root", workspace_root(config)),
+      ~S'''
+      case "$workspace" in /*) ;; *) workspace="$PWD/$workspace" ;; esac
+      case "$root" in /*) ;; *) root="$PWD/$root" ;; esac
+      while [ "$root" != / ] && [ "${root%/}" != "$root" ]; do
+        root=${root%/}
+      done
+      case "$workspace" in
+        "$root"/*) child=${workspace#"$root"/} ;;
+        *) child=$workspace ;;
+      esac
+      case "/$child/" in *"/../"*) exit 74 ;; esac
+      while [ "$workspace" != / ] && [ "${workspace%/}" != "$workspace" ]; do
+        workspace=${workspace%/}
+      done
+      case "${workspace##*/}" in ''|.|..) exit 74 ;; esac
+      [ ! -L "$workspace" ] || exit 74
+      canonical_dir_or_missing() {
+        path=$1
+        suffix=
+        while [ ! -d "$path" ]; do
+          [ ! -L "$path" ] || return 1
+          base=${path##*/}
+          parent=${path%/*}
+          [ -n "$parent" ] || parent=/
+          [ "$parent" != "$path" ] || return 1
+          if [ -e "$path" ]; then
+            parent_real=$(cd -P -- "$parent" && pwd -P) || return 1
+            printf '%s/%s%s' "$parent_real" "$base" "$suffix"
+            return
+          fi
+          suffix="/$base$suffix"
+          path=$parent
+        done
+        (cd -P -- "$path" && printf '%s%s' "$PWD" "$suffix")
+      }
+      root_real=$(canonical_dir_or_missing "$root") || exit 74
+      workspace_real=$(canonical_dir_or_missing "$workspace") || exit 74
+      case "$workspace_real" in "$root_real"/*) ;; *) exit 74 ;; esac
+      workspace=$workspace_real
+      ''',
+      if(require_existing, do: "[ -d \"$workspace\" ] || exit 74", else: "")
+    ]
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n")
   end
 
   defp remote_shell_assign(variable_name, raw_path)
@@ -673,22 +786,15 @@ defmodule CymphonyElixir.Workspace do
     end
   end
 
-  defp run_remote_command(worker_host, script, timeout_ms)
+  defp run_remote_command(worker_host, script, timeout_ms, opts)
        when is_binary(worker_host) and is_binary(script) and is_integer(timeout_ms) and timeout_ms > 0 do
-    task =
-      Task.async(fn ->
-        SSH.run(worker_host, script, stderr_to_stdout: true)
-      end)
-
-    case Task.yield(task, timeout_ms) do
-      {:ok, result} ->
-        result
-
-      nil ->
-        Task.shutdown(task, :brutal_kill)
-        {:error, {:workspace_hook_timeout, "remote_command", timeout_ms}}
+    case PortGuard.run(port_supervisor(opts), fn -> SSH.start_port(worker_host, PortGuard.prepare(script)) end, timeout_ms, handshake: true) do
+      {:error, :timeout} -> {:error, {:workspace_hook_timeout, "remote_command", timeout_ms}}
+      result -> result
     end
   end
+
+  defp port_supervisor(opts), do: Keyword.get(opts, :port_supervisor, CymphonyElixir.TaskSupervisor)
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
@@ -754,9 +860,9 @@ defmodule CymphonyElixir.Workspace do
     "issue_id=#{issue_id || "n/a"} issue_identifier=#{issue_identifier || "issue"}"
   end
 
-  defp hooks_config, do: Config.settings!().hooks
   defp hooks_config(nil), do: Config.settings!().hooks
   defp hooks_config(config), do: config.hooks
 
-  defp worker_config, do: Config.settings!().worker
+  defp worker_config(nil), do: Config.settings!().worker
+  defp worker_config(config), do: config.worker
 end

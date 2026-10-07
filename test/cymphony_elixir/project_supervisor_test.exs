@@ -44,12 +44,12 @@ defmodule CymphonyElixir.ProjectSupervisorTest do
     assert ProjectSupervisor.list_orchestrators(missing) == []
   end
 
-  test "init/1 builds a one_for_one supervisor with store and orchestrator children" do
+  test "init/1 builds a one_for_all runtime with store, task supervisor and orchestrator" do
     assert {:ok, {flags, children}} =
              ProjectSupervisor.init(project_name: "Farm", workflow_path: "/tmp/WORKFLOW.md")
 
-    assert flags.strategy == :one_for_one
-    assert length(children) == 2
+    assert flags.strategy == :one_for_all
+    assert length(children) == 4
   end
 
   defp gate_opts(children) do
@@ -81,7 +81,7 @@ defmodule CymphonyElixir.ProjectSupervisorTest do
       })
 
     assert {:ok, {_flags, children}} = ProjectSupervisor.init(project_name: name, workflow_path: "/tmp/WORKFLOW.md")
-    assert length(children) == 3
+    assert length(children) == 5
 
     # The mirror is cloned over HTTPS for the same reason the workspace is.
     assert gate_opts(children) |> Keyword.fetch!(:repo_url) == "https://example.com/group/repo.git"
@@ -89,7 +89,7 @@ defmodule CymphonyElixir.ProjectSupervisorTest do
     # There is nothing to check ancestry against without a repository, and a
     # missing gate degrades to the tracker-state behaviour everywhere.
     assert {:ok, {_flags, plain}} = ProjectSupervisor.init(project_name: other, workflow_path: "/tmp/WORKFLOW.md")
-    assert length(plain) == 2
+    assert length(plain) == 4
   end
 
   test "init/1 keeps an SSH remote for the mirror when rewrite_ssh_remote is false" do

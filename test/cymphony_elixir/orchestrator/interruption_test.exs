@@ -44,6 +44,22 @@ defmodule CymphonyElixir.Orchestrator.InterruptionTest do
     )
   end
 
+  defp await_io(%{work: %{io_jobs: jobs}} = state) when map_size(jobs) == 0, do: state
+
+  defp await_io(state) do
+    receive do
+      {ref, _result} = message when is_map_key(state.work.io_jobs, ref) ->
+        {:noreply, state} = Orchestrator.handle_info(message, state)
+        await_io(state)
+
+      {:DOWN, ref, :process, _pid, _reason} = message when is_map_key(state.work.io_jobs, ref) ->
+        {:noreply, state} = Orchestrator.handle_info(message, state)
+        await_io(state)
+    after
+      2_000 -> flunk("asynchronous I/O did not finish")
+    end
+  end
+
   defp base_state(extra \\ %{}) do
     struct!(
       %State{
@@ -152,6 +168,8 @@ defmodule CymphonyElixir.Orchestrator.InterruptionTest do
         })
 
       {:noreply, state} = Orchestrator.handle_info({:retry_issue, "MT-3", token}, state)
+      # The retry re-reads the tracker in an I/O job; apply its result.
+      state = await_io(state)
       cancel_timers(state)
 
       retry = state.retry_attempts["MT-3"]

@@ -6,7 +6,7 @@ defmodule CymphonyElixir.AgentRunner do
 
   require Logger
   alias CymphonyElixir.Agent.Runner
-  alias CymphonyElixir.{Config, HarnessStream, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias CymphonyElixir.{Config, HarnessStream, Linear.Issue, PromptBuilder, PublicEvent, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -16,6 +16,13 @@ defmodule CymphonyElixir.AgentRunner do
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, agent_update_recipient \\ nil, opts \\ []) do
     config = Keyword.get(opts, :config)
+
+    agent_update_recipient =
+      case Keyword.get(opts, :run_token) do
+        token when is_reference(token) -> {agent_update_recipient, token}
+        _ -> agent_update_recipient
+      end
+
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_hosts = if config, do: config.worker.ssh_hosts, else: Config.settings!().worker.ssh_hosts
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), worker_hosts)
@@ -36,29 +43,30 @@ defmodule CymphonyElixir.AgentRunner do
 
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+        # Sanitize structured leaves before inspection can encode invalid bytes.
         # Reason first: this message becomes the retry-queue error text, which
         # the dashboard truncates, and the issue context is already in the log
         # line above.
-        raise RuntimeError, "Agent run failed: #{inspect(reason)} (#{issue_context(issue)})"
+        raise RuntimeError, "Agent run failed: #{PublicEvent.format_diagnostic(reason)} (#{issue_context(issue)})"
     end
   end
 
   defp run_on_worker_host(issue, agent_update_recipient, opts, worker_host) do
-    config = Keyword.get(opts, :config)
     provider_override = Keyword.get(opts, :provider_override)
+    workspace_opts = Keyword.take(opts, [:config, :port_supervisor])
 
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)} provider=#{provider_override || "default"}")
 
-    case Workspace.create_for_issue(issue, worker_host, config: config) do
+    case Workspace.create_for_issue(issue, worker_host, workspace_opts) do
       {:ok, workspace} ->
         send_worker_runtime_info(agent_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host, config: config) do
+          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host, workspace_opts) do
             run_agent_turns(workspace, issue, agent_update_recipient, opts, worker_host)
           end
         after
-          Workspace.run_after_run_hook(workspace, issue, worker_host, config: config)
+          Workspace.run_after_run_hook(workspace, issue, worker_host, workspace_opts)
         end
 
       {:error, reason} ->
@@ -73,7 +81,7 @@ defmodule CymphonyElixir.AgentRunner do
   end
 
   defp send_agent_update(recipient, %Issue{id: issue_id}, message)
-       when is_binary(issue_id) and is_pid(recipient) do
+       when is_binary(issue_id) and (is_pid(recipient) or is_tuple(recipient)) do
     note_session_identified(message)
 
     if is_map(message) and message[:event] == :harness_stdout do
@@ -81,7 +89,7 @@ defmodule CymphonyElixir.AgentRunner do
       HarnessStream.append(issue_id, to_string(message[:raw] || ""))
       maybe_send_harness_heartbeat(recipient, issue_id, message)
     else
-      send(recipient, {:agent_worker_update, issue_id, message})
+      send_to_recipient(recipient, {:agent_worker_update, issue_id, message})
     end
 
     :ok
@@ -108,14 +116,19 @@ defmodule CymphonyElixir.AgentRunner do
       _ ->
         Process.put(key, now_ms)
         timestamp = message[:timestamp] || DateTime.utc_now()
-        send(recipient, {:agent_worker_update, issue_id, %{event: :harness_heartbeat, timestamp: timestamp}})
+
+        send_to_recipient(
+          recipient,
+          {:agent_worker_update, issue_id, %{event: :harness_heartbeat, timestamp: timestamp}}
+        )
+
         :ok
     end
   end
 
   defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
-    send(
+       when is_binary(issue_id) and (is_pid(recipient) or is_tuple(recipient)) and is_binary(workspace) do
+    send_to_recipient(
       recipient,
       {:worker_runtime_info, issue_id,
        %{
@@ -129,19 +142,28 @@ defmodule CymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
+  defp send_to_recipient({recipient, token}, {tag, issue_id, message}) do
+    send(recipient, {tag, issue_id, token, message})
+  end
+
+  defp send_to_recipient(recipient, message), do: send(recipient, message)
+
   defp run_agent_turns(workspace, issue, agent_update_recipient, opts, worker_host) do
     config = Keyword.get(opts, :config)
 
     max_turns =
-      Keyword.get(opts, :max_turns) || if config, do: config.agent.max_turns, else: Config.settings!().agent.max_turns
+      Keyword.get(opts, :max_turns) ||
+        if config, do: config.agent.max_turns, else: Config.settings!().agent.max_turns
 
     issue_state_fetcher =
       Keyword.get(opts, :issue_state_fetcher) ||
-        if config, do: &Tracker.fetch_issue_states_by_ids(&1, config), else: &Tracker.fetch_issue_states_by_ids/1
+        if config,
+          do: &Tracker.fetch_issue_states_by_ids(&1, config),
+          else: &Tracker.fetch_issue_states_by_ids/1
 
     session_opts =
       [worker_host: worker_host, config: config] ++
-        Keyword.take(opts, [:agent_kind, :model, :effort, :provider_override])
+        Keyword.take(opts, [:agent_kind, :model, :effort, :provider_override, :port_supervisor])
 
     with {:ok, session} <- Runner.start_session(workspace, session_opts) do
       session = %{session | session_id: resume_session_id(opts)}
@@ -290,7 +312,8 @@ defmodule CymphonyElixir.AgentRunner do
     """
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, config) when is_binary(issue_id) do
+  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, config)
+       when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
         if active_issue_state?(refreshed_issue.state, config) do
@@ -311,7 +334,9 @@ defmodule CymphonyElixir.AgentRunner do
 
   defp active_issue_state?(state_name, config) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
-    active_states = if config, do: config.tracker.active_states, else: Config.settings!().tracker.active_states
+
+    active_states =
+      if config, do: config.tracker.active_states, else: Config.settings!().tracker.active_states
 
     active_states
     |> Enum.any?(fn active_state -> normalize_issue_state(active_state) == normalized_state end)

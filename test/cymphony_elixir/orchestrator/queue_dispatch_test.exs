@@ -67,7 +67,7 @@ defmodule CymphonyElixir.Orchestrator.QueueDispatchTest do
     assert :ok = Orchestrator.reorder_queue(pid, ["MT-B", "MT-A"])
     assert Enum.map(GenServer.call(pid, :snapshot).waiting, & &1.identifier) == ["MT-B", "MT-A"]
 
-    :sys.replace_state(pid, fn state -> %{state | max_concurrent_agents: 1} end)
+    assert :ok = Orchestrator.set_concurrency(pid, 1)
     poll(pid)
 
     snapshot = GenServer.call(pid, :snapshot)
@@ -273,7 +273,7 @@ defmodule CymphonyElixir.Orchestrator.QueueDispatchTest do
     snapshot = GenServer.call(pid, :snapshot)
     assert [%{agent_kind: "codex", model: "gpt-5.2-codex", effort: "high"}] = snapshot.waiting
 
-    :sys.replace_state(pid, fn state -> %{state | max_concurrent_agents: 1} end)
+    assert :ok = Orchestrator.set_concurrency(pid, 1)
     poll(pid)
 
     snapshot = GenServer.call(pid, :snapshot)
@@ -346,6 +346,25 @@ defmodule CymphonyElixir.Orchestrator.QueueDispatchTest do
     end)
   end
 
+  test "set_queue_run_spec preserves pins written after the orchestrator loaded its state" do
+    project_name = "concurrent-pins-#{System.unique_integer([:positive])}"
+
+    with_config_dir(fn _tmp ->
+      :ok = CymphonyConfig.save(%{"projects" => [%{"name" => project_name, "queue_pins" => %{}}]})
+      pid = start_queue_orchestrator(:ConcurrentPins, slots: 0, project_name: project_name)
+
+      assert {:ok, _} =
+               CymphonyConfig.update_project_queue_pin(project_name, "EXTERNAL-1", %{"effort" => "low"})
+
+      assert :ok = Orchestrator.set_queue_run_spec(pid, "LOCAL-1", %{model: "new-model"})
+
+      {:ok, config} = CymphonyConfig.load()
+      pins = hd(config["projects"])["queue_pins"]
+      assert pins["EXTERNAL-1"] == %{"effort" => "low"}
+      assert pins["LOCAL-1"] == %{"model" => "new-model"}
+    end)
+  end
+
   defp start_queue_orchestrator(suffix, opts \\ []) do
     isolate_config_dir()
 
@@ -376,15 +395,23 @@ defmodule CymphonyElixir.Orchestrator.QueueDispatchTest do
     :sys.replace_state(pid, fn state ->
       if is_reference(state.tick_timer_ref), do: Process.cancel_timer(state.tick_timer_ref)
 
+      # Zero is a test-only capacity fixture (the public setter rejects it).
+      # Mark it as explicit so a workflow refresh cannot replace it with the
+      # file default while these queue tests exercise waiting behavior.
       %{
         state
         | paused: true,
           tick_timer_ref: nil,
           tick_token: nil,
           poll_check_in_progress: false,
-          max_concurrent_agents: slots
+          max_concurrent_agents: if(slots == 0, do: 0, else: state.max_concurrent_agents),
+          runtime_concurrency: if(slots == 0, do: 0, else: nil)
       }
     end)
+
+    if slots > 0 do
+      assert :ok = Orchestrator.set_concurrency(pid, slots)
+    end
 
     pid
   end

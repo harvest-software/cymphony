@@ -446,7 +446,7 @@ defmodule CymphonyElixir.CoreTest do
       refute Map.has_key?(updated_state.running, issue_id)
       refute MapSet.member?(updated_state.claimed, issue_id)
       refute Process.alive?(agent_pid)
-      refute File.exists?(workspace)
+      assert_workspace_removed(workspace)
     after
       File.rm_rf(test_root)
     end
@@ -485,8 +485,6 @@ defmodule CymphonyElixir.CoreTest do
         end
       end)
 
-      Process.sleep(50)
-
       assert {:ok, workspace} =
                CymphonyElixir.PathSafety.canonicalize(Path.join(test_root, issue_identifier))
 
@@ -516,8 +514,7 @@ defmodule CymphonyElixir.CoreTest do
         |> Map.put(:retry_attempts, %{})
       end)
 
-      send(pid, :tick)
-      Process.sleep(100)
+      assert :ok = Orchestrator.run_poll_cycle_for_test(pid)
       state = :sys.get_state(pid)
 
       refute Map.has_key?(state.running, issue_id)
@@ -838,7 +835,7 @@ defmodule CymphonyElixir.CoreTest do
     state = :sys.get_state(pid)
     refute MapSet.member?(state.claimed, issue_id)
     refute Map.has_key?(state.retry_attempts, issue_id)
-    refute File.exists?(workspace)
+    assert_workspace_removed(workspace)
   end
 
   test "normal completion never abandons, even past the retry cap (rework/wake safety)" do
@@ -1113,6 +1110,18 @@ defmodule CymphonyElixir.CoreTest do
 
     assert coalesced_state.tick_token == refreshed_state.tick_token
     assert {:noreply, ^coalesced_state} = Orchestrator.handle_info({:tick, stale_tick_token}, coalesced_state)
+  end
+
+  defp assert_workspace_removed(workspace, attempts \\ 100)
+  defp assert_workspace_removed(workspace, 0), do: refute(File.exists?(workspace))
+
+  defp assert_workspace_removed(workspace, attempts) do
+    if File.exists?(workspace) do
+      Process.sleep(10)
+      assert_workspace_removed(workspace, attempts - 1)
+    else
+      :ok
+    end
   end
 
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do

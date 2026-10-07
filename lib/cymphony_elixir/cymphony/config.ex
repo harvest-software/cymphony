@@ -6,6 +6,7 @@ defmodule CymphonyElixir.Cymphony.Config do
   alias CymphonyElixir.Agent
   alias CymphonyElixir.Config.Schema
   alias CymphonyElixir.Cymphony.Defaults
+  alias CymphonyElixir.Cymphony.ShellProvider
 
   @config_dir "~/.cymphony"
   # Tracker backends a generated `WORKFLOW.md` may name. "memory" is the test
@@ -35,7 +36,8 @@ defmodule CymphonyElixir.Cymphony.Config do
     case File.read(config_path()) do
       {:ok, content} ->
         case Jason.decode(content) do
-          {:ok, parsed} -> {:ok, normalize(parsed)}
+          {:ok, parsed} when is_map(parsed) -> {:ok, normalize(parsed)}
+          {:ok, _parsed} -> {:error, "Invalid config in #{config_path()}: expected a JSON object"}
           {:error, reason} -> {:error, "Invalid JSON in #{config_path()}: #{inspect(reason)}"}
         end
 
@@ -617,6 +619,73 @@ defmodule CymphonyElixir.Cymphony.Config do
 
   def update_project_queue(_project_name, _attrs), do: {:error, :invalid_queue}
 
+  @doc "Atomically patches one issue's queue pin without replacing other pins."
+  @spec update_project_queue_pin(String.t() | nil, String.t(), map()) ::
+          {:ok, map()} | {:error, term()}
+  def update_project_queue_pin(project_name, issue_key, pin)
+      when (is_binary(project_name) or is_nil(project_name)) and is_binary(issue_key) and
+             is_map(pin) do
+    with_write_lock(fn ->
+      with {:ok, id} <- sanitize_queue_id(issue_key),
+           {:ok, fields} <- sanitize_pin_fields(pin),
+           {:ok, config} <- load(),
+           {:ok, project} <- queue_project(config, project_name),
+           existing when is_map(existing) <- Map.get(project, "queue_pins", %{}),
+           {:ok, pins} <- sanitize_queue_pins(existing),
+           updated_pins = patch_queue_pin(pins, id, pin, fields),
+           {:ok, updated} <- apply_project_queue(config, project_name, %{"queue_pins" => updated_pins}),
+           :ok <- save(updated) do
+        {:ok, updated_pins}
+      else
+        :error -> {:error, :invalid_queue_pin}
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_queue_pin}
+      end
+    end)
+  end
+
+  def update_project_queue_pin(_project_name, _issue_key, _pin), do: {:error, :invalid_queue_pin}
+
+  defp queue_project(%{"projects" => projects}, project_name) when is_list(projects) do
+    case Enum.find(projects, &(&1["name"] == project_name)) do
+      nil -> {:error, :project_not_found}
+      project -> {:ok, project}
+    end
+  end
+
+  defp queue_project(config, _project_name) when is_map(config), do: {:ok, config}
+
+  defp patch_queue_pin(pins, id, pin, _fields) when map_size(pin) == 0,
+    do: Map.delete(pins, id)
+
+  defp patch_queue_pin(pins, id, _pin, fields) do
+    Map.update(pins, id, fields, &Map.merge(&1, fields))
+  end
+
+  @doc "Looks up a top-level config provider map, filtering for the active agent."
+  @spec provider_env(String.t(), [String.t()]) :: {:ok, map()} | :not_found
+  def provider_env(name, prefixes) when is_binary(name) and is_list(prefixes) do
+    case load() do
+      {:ok, %{"providers" => providers}} when is_map(providers) ->
+        case Map.get(providers, name) do
+          env when is_map(env) ->
+            {:ok,
+             env
+             |> Enum.filter(fn {key, value} ->
+               is_binary(key) and is_binary(value) and
+                 Enum.any?(prefixes, &String.starts_with?(key, &1))
+             end)
+             |> Map.new()}
+
+          _ ->
+            :not_found
+        end
+
+      _ ->
+        :not_found
+    end
+  end
+
   defp sanitize_queue_attrs(attrs) do
     Enum.reduce_while(@queue_attr_keys, {:ok, %{}}, &sanitize_queue_attr_step(&1, &2, attrs))
   end
@@ -781,7 +850,7 @@ defmodule CymphonyElixir.Cymphony.Config do
   Trims whitespace and drops empty segments. Returns `{:error, :empty}` if no
   non-empty segments remain.
   """
-  @spec parse_providers_csv(String.t()) :: {:ok, [String.t()]} | {:error, :empty}
+  @spec parse_providers_csv(String.t()) :: {:ok, [String.t()]} | {:error, :empty | :invalid}
   def parse_providers_csv(value) when is_binary(value) do
     list =
       value
@@ -789,7 +858,11 @@ defmodule CymphonyElixir.Cymphony.Config do
       |> Enum.map(&String.trim/1)
       |> Enum.reject(&(&1 == ""))
 
-    if list == [], do: {:error, :empty}, else: {:ok, list}
+    cond do
+      list == [] -> {:error, :empty}
+      Enum.all?(list, &ShellProvider.valid_name?/1) -> {:ok, list}
+      true -> {:error, :invalid}
+    end
   end
 
   def parse_providers_csv(_), do: {:error, :empty}
@@ -1091,6 +1164,23 @@ defmodule CymphonyElixir.Cymphony.Config do
     |> maybe_put_extra_args(config, "claude")
   end
 
+  defp agent_section_map(config, "codex") do
+    %{"command" => Defaults.codex_command(), "sandbox" => Defaults.codex_sandbox()}
+    |> maybe_put_provider_keys(config, "codex")
+    |> maybe_put_extra_args(config, "codex")
+  end
+
+  defp agent_section_map(config, "antigravity") do
+    %{
+      "command" => Defaults.antigravity_command(),
+      "output_format" => "stream-json",
+      "skip_permissions" => true
+    }
+    |> maybe_put_new_project(config)
+    |> maybe_put_provider_keys(config, "antigravity")
+    |> maybe_put_extra_args(config, "antigravity")
+  end
+
   # `--allowedTools`. Emitted rather than left to the Schema default because
   # the default cannot know the tracker: an agent required by its prompt to
   # update a ticket needs that tracker's MCP tools granted, and under `-p`
@@ -1140,23 +1230,6 @@ defmodule CymphonyElixir.Cymphony.Config do
 
   defp warn_invalid(key, value) do
     Logger.warning("Ignoring invalid #{key} in config.json: #{inspect(value)}")
-  end
-
-  defp agent_section_map(config, "codex") do
-    %{"command" => Defaults.codex_command(), "sandbox" => Defaults.codex_sandbox()}
-    |> maybe_put_provider_keys(config, "codex")
-    |> maybe_put_extra_args(config, "codex")
-  end
-
-  defp agent_section_map(config, "antigravity") do
-    %{
-      "command" => Defaults.antigravity_command(),
-      "output_format" => "stream-json",
-      "skip_permissions" => true
-    }
-    |> maybe_put_new_project(config)
-    |> maybe_put_provider_keys(config, "antigravity")
-    |> maybe_put_extra_args(config, "antigravity")
   end
 
   # `claude --bare` skips "keychain reads" among other things, so a session
@@ -1361,12 +1434,16 @@ defmodule CymphonyElixir.Cymphony.Config do
   # yet, which is the normal state of affairs for the first sub-task of a new
   # parent: clone the default branch instead and let the prompt tell the agent
   # to create and push the base branch.
+  # The URL is quoted as one operand after `--`, so a value that starts with
+  # `-` (`--upload-pack=…`) can never be parsed as a git option.
   defp clone_command(clone_url) do
+    url = CymphonyElixir.Shell.escape(clone_url)
+
     """
     if [ -n "${CYMPHONY_BASE_BRANCH:-}" ]; then
-      git clone --depth 1 --branch "$CYMPHONY_BASE_BRANCH" #{clone_url} . || git clone --depth 1 #{clone_url} .
+      git clone --depth 1 --branch "$CYMPHONY_BASE_BRANCH" -- #{url} . || git clone --depth 1 -- #{url} .
     else
-      git clone --depth 1 #{clone_url} .
+      git clone --depth 1 -- #{url} .
     fi
     """
   end

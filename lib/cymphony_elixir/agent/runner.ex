@@ -11,8 +11,9 @@ defmodule CymphonyElixir.Agent.Runner do
 
   require Logger
 
-  alias CymphonyElixir.{Agent, Config, PathSafety, SSH, Text}
-  alias CymphonyElixir.Agent.StreamSignals
+  alias CymphonyElixir.{Agent, Config, PathSafety, SSH, Text, Workspace}
+  alias CymphonyElixir.Agent.{OutputWindow, PortGuard, StreamSignals}
+  alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
   alias CymphonyElixir.Cymphony.ShellProvider
   alias CymphonyElixir.Mcp.ConfigWriter
   alias CymphonyElixir.YouTrack.Client, as: YouTrackClient
@@ -36,6 +37,7 @@ defmodule CymphonyElixir.Agent.Runner do
   ]
 
   @port_line_bytes 1_048_576
+  @max_retained_line_bytes 262_144
   @max_stream_log_bytes 1_000
   @harness_stdout_max 2048
   @port_eof_drain_ms 250
@@ -44,6 +46,7 @@ defmodule CymphonyElixir.Agent.Runner do
 
   @type session :: %{
           port: port() | nil,
+          port_supervisor: GenServer.server(),
           metadata: map(),
           session_id: String.t() | nil,
           workspace: Path.t(),
@@ -69,7 +72,7 @@ defmodule CymphonyElixir.Agent.Runner do
     worker_host = Keyword.get(opts, :worker_host)
     config = Keyword.get(opts, :config)
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host, config),
+    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host, config, opts),
          {:ok, run_spec} <- build_run_spec(expanded_workspace, worker_host, config, opts),
          {:ok, agent_module} <- Agent.module_for(run_spec.kind) do
       {:ok,
@@ -81,7 +84,8 @@ defmodule CymphonyElixir.Agent.Runner do
          worker_host: worker_host,
          config: config,
          run_spec: run_spec,
-         agent_module: agent_module
+         agent_module: agent_module,
+         port_supervisor: Keyword.get(opts, :port_supervisor, CymphonyElixir.TaskSupervisor)
        }}
     end
   end
@@ -102,55 +106,73 @@ defmodule CymphonyElixir.Agent.Runner do
     run_spec = %{run_spec | prompt: prompt, session_id: session_id}
 
     with {:ok, command} <- agent_module.build_command(run_spec),
-         {:ok, port} <-
-           start_port_for_command(command, workspace, worker_host, run_spec, agent_module, config) do
-      metadata = port_metadata(port, worker_host)
-      display_session_id = "#{session_id || "new"}"
+         {:ok, port, guard_watch} <-
+           PortGuard.open(
+             Map.get(session, :port_supervisor, CymphonyElixir.TaskSupervisor),
+             fn ->
+               start_port_for_command(command, workspace, worker_host, run_spec, agent_module, config)
+             end,
+             handshake: true
+           ) do
+      try do
+        metadata = port_metadata(port, worker_host)
+        display_session_id = "#{session_id || "new"}"
 
-      emit_message(
-        on_message,
-        :session_started,
-        %{session_id: display_session_id, thread_id: display_session_id, turn_id: 1},
-        metadata
-      )
+        emit_message(
+          on_message,
+          :session_started,
+          %{session_id: display_session_id, thread_id: display_session_id, turn_id: 1},
+          metadata
+        )
 
-      case await_process_completion(port, on_message, metadata, run_spec, agent_module, config) do
-        {:ok, result} ->
-          new_session_id = result[:session_id] || session_id
+        case await_process_completion(
+               port,
+               on_message,
+               metadata,
+               run_spec,
+               agent_module,
+               config,
+               guard_watch.ref
+             ) do
+          {:ok, result} ->
+            new_session_id = result[:session_id] || session_id
 
-          Logger.info("Agent session completed for #{issue_context(issue)} session_id=#{new_session_id}")
+            Logger.info("Agent session completed for #{issue_context(issue)} session_id=#{new_session_id}")
 
-          emit_message(
-            on_message,
-            :turn_completed,
-            %{
-              session_id: new_session_id,
-              result: result[:result],
-              usage: result[:usage],
-              raw: result[:raw]
-            },
-            metadata
-          )
+            emit_message(
+              on_message,
+              :turn_completed,
+              %{
+                session_id: new_session_id,
+                result: result[:result],
+                usage: result[:usage],
+                raw: result[:raw]
+              },
+              metadata
+            )
 
-          {:ok,
-           %{
-             result: result,
-             session_id: new_session_id,
-             thread_id: new_session_id,
-             turn_id: 1
-           }}
+            {:ok,
+             %{
+               result: result,
+               session_id: new_session_id,
+               thread_id: new_session_id,
+               turn_id: 1
+             }}
 
-        {:error, reason} ->
-          Logger.warning("Agent session ended with error for #{issue_context(issue)} session_id=#{display_session_id}: #{inspect(reason)}")
+          {:error, reason} ->
+            Logger.warning("Agent session ended with error for #{issue_context(issue)} session_id=#{display_session_id}: #{inspect(reason)}")
 
-          emit_message(
-            on_message,
-            :turn_ended_with_error,
-            %{session_id: display_session_id, reason: reason},
-            metadata
-          )
+            emit_message(
+              on_message,
+              :turn_ended_with_error,
+              %{session_id: display_session_id, reason: reason},
+              metadata
+            )
 
-          {:error, reason}
+            {:error, reason}
+        end
+      after
+        PortGuard.finish(guard_watch)
       end
     else
       {:error, reason} ->
@@ -213,7 +235,7 @@ defmodule CymphonyElixir.Agent.Runner do
               :exit_status,
               :eof,
               :stderr_to_stdout,
-              args: [~c"-c", String.to_charlist(local_launch_script(command))],
+              args: [~c"-c", String.to_charlist(PortGuard.prepare(local_launch_script(command)))],
               cd: String.to_charlist(workspace),
               line: @port_line_bytes,
               env: agent_env(run_spec, agent_module, config)
@@ -230,7 +252,7 @@ defmodule CymphonyElixir.Agent.Runner do
   defp start_port_for_command(command, workspace, worker_host, run_spec, agent_module, config)
        when is_binary(worker_host) do
     remote_command = remote_launch_command(workspace, command, run_spec, agent_module, config)
-    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+    SSH.start_port(worker_host, PortGuard.prepare(remote_command), line: @port_line_bytes)
   end
 
   # Wrap the user's command so shell-function aliases (e.g. `cz`, `cm`, `cv1`
@@ -266,7 +288,7 @@ defmodule CymphonyElixir.Agent.Runner do
 
   defp remote_launch_command(workspace, command, run_spec, agent_module, config)
        when is_binary(workspace) do
-    (["cd #{shell_escape(workspace)}"] ++
+    ([Workspace.remote_guard_script(workspace, config, true), "cd \"$workspace\""] ++
        remote_env_exports(run_spec, agent_module, config) ++ ["exec #{command}"])
     |> Enum.join(" && ")
   end
@@ -318,7 +340,15 @@ defmodule CymphonyElixir.Agent.Runner do
 
   defp provider_env(provider_name, agent_module)
        when is_binary(provider_name) and provider_name != "" do
-    case ShellProvider.load_env(provider_name, agent_module.auth_env_prefixes()) do
+    prefixes = agent_module.auth_env_prefixes()
+
+    result =
+      case CymphonyConfig.provider_env(provider_name, prefixes) do
+        {:ok, env_map} -> {:ok, env_map}
+        :not_found -> ShellProvider.load_env(provider_name, prefixes)
+      end
+
+    case result do
       {:ok, env_map} when is_map(env_map) ->
         normalize_env_map(env_map)
 
@@ -409,11 +439,11 @@ defmodule CymphonyElixir.Agent.Runner do
     |> Map.new()
   end
 
-  defp await_process_completion(port, on_message, metadata, run_spec, agent_module, config) do
+  defp await_process_completion(port, on_message, metadata, run_spec, agent_module, config, guard_ref) do
     wrapped = wrap_on_message(on_message, metadata)
     Process.put(@stream_signals_key, %{kind: run_spec.kind, session_id: nil, usage_limit: nil})
 
-    case collect_output(port, config, wrapped) do
+    case collect_output(port, config, wrapped, guard_ref) do
       {:ok, lines} ->
         agent_module.parse_output(lines, run_spec, wrapped)
 
@@ -428,43 +458,61 @@ defmodule CymphonyElixir.Agent.Runner do
     fn details -> on_message.(Map.merge(metadata, details)) end
   end
 
-  defp collect_output(port, config, on_message) do
-    collect_output(port, "", [], config, on_message, false)
+  defp collect_output(port, config, on_message, guard_ref) do
+    collect_output(port, "", OutputWindow.new(), config, on_message, false, guard_ref)
   end
 
-  # Tail-recursive: accumulates completed lines in reverse and reverses once at
-  # the end, so a long streaming turn (thousands of events) does not grow the
-  # call stack proportionally to the number of output lines.
+  # Tail-recursive: completed lines enter a finite output window rather than
+  # accumulating an entire multi-hour stream in process state.
   # EP-STREAM: emit :harness_stdout incrementally for completed lines (and a
   # leftover buffer on exit 0). :noeol chunks stay buffered and are not emitted.
   # parse_output still runs only after a successful exit.
   # exit_status can race ahead of the last {:noeol, _} chunk; wait for :eof
   # (or a short drain) so leftover output is not dropped.
-  defp collect_output(port, buffer, acc, config, on_message, eof?) do
+  defp collect_output(port, buffer, window, config, on_message, eof?, guard_ref) do
     timeout_ms = if config, do: config.agent.turn_timeout_ms, else: Config.settings!().agent.turn_timeout_ms
 
     receive do
+      {:DOWN, ^guard_ref, :process, _guard, reason} ->
+        {:error, {:port_guard_exit, reason}}
+
       {^port, {:data, {:eol, chunk}}} ->
-        line = buffer <> to_string(chunk)
-        log_stream_line(line)
-        emit_line(on_message, line)
-        collect_output(port, "", [line | acc], config, on_message, eof?)
+        case append_output_chunk(buffer, chunk) do
+          {:ok, line} ->
+            log_stream_line(line)
+            emit_line(on_message, line)
+            collect_output(port, "", OutputWindow.push(window, line), config, on_message, eof?, guard_ref)
+
+          {:error, _} = error ->
+            stop_port(port)
+            error
+        end
 
       {^port, {:data, {:noeol, chunk}}} ->
-        collect_output(port, buffer <> to_string(chunk), acc, config, on_message, eof?)
+        case append_output_chunk(buffer, chunk) do
+          {:ok, next_buffer} ->
+            collect_output(port, next_buffer, window, config, on_message, eof?, guard_ref)
+
+          {:error, _} = error ->
+            stop_port(port)
+            error
+        end
 
       {^port, :eof} ->
-        collect_output(port, buffer, acc, config, on_message, true)
+        collect_output(port, buffer, window, config, on_message, true, guard_ref)
 
       {^port, {:exit_status, status}} ->
-        {buffer, acc} =
+        drained =
           if eof? do
-            {buffer, acc}
+            {:ok, buffer, window}
           else
-            drain_port_until_eof(port, buffer, acc, on_message)
+            drain_port_until_eof(port, buffer, window, on_message)
           end
 
-        finalize_collected_output(status, buffer, acc, on_message)
+        case drained do
+          {:ok, buffer, window} -> finalize_collected_output(status, buffer, window, on_message)
+          {:error, _} = error -> error
+        end
     after
       timeout_ms ->
         stop_port(port)
@@ -472,26 +520,49 @@ defmodule CymphonyElixir.Agent.Runner do
     end
   end
 
-  defp drain_port_until_eof(port, buffer, acc, on_message) do
+  defp drain_port_until_eof(port, buffer, window, on_message) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
-        line = buffer <> to_string(chunk)
-        log_stream_line(line)
-        emit_line(on_message, line)
-        drain_port_until_eof(port, "", [line | acc], on_message)
+        case append_output_chunk(buffer, chunk) do
+          {:ok, line} ->
+            log_stream_line(line)
+            emit_line(on_message, line)
+            drain_port_until_eof(port, "", OutputWindow.push(window, line), on_message)
+
+          {:error, _} = error ->
+            stop_port(port)
+            error
+        end
 
       {^port, {:data, {:noeol, chunk}}} ->
-        drain_port_until_eof(port, buffer <> to_string(chunk), acc, on_message)
+        case append_output_chunk(buffer, chunk) do
+          {:ok, next_buffer} ->
+            drain_port_until_eof(port, next_buffer, window, on_message)
+
+          {:error, _} = error ->
+            stop_port(port)
+            error
+        end
 
       {^port, :eof} ->
-        {buffer, acc}
+        {:ok, buffer, window}
     after
       @port_eof_drain_ms ->
-        {buffer, acc}
+        {:ok, buffer, window}
     end
   end
 
-  defp finalize_collected_output(0, buffer, acc, on_message) do
+  defp append_output_chunk(buffer, chunk) do
+    chunk = to_string(chunk)
+
+    if byte_size(buffer) + byte_size(chunk) <= @max_retained_line_bytes do
+      {:ok, buffer <> chunk}
+    else
+      {:error, :agent_output_line_too_large}
+    end
+  end
+
+  defp finalize_collected_output(0, buffer, window, on_message) do
     remaining = buffer |> to_string() |> String.trim()
 
     if remaining != "" do
@@ -499,14 +570,14 @@ defmodule CymphonyElixir.Agent.Runner do
       emit_line(on_message, remaining)
     end
 
-    lines = if remaining != "", do: [remaining | acc], else: acc
-    {:ok, Enum.reverse(lines)}
+    window = if remaining != "", do: OutputWindow.push(window, remaining), else: window
+    {:ok, OutputWindow.lines(window)}
   end
 
-  defp finalize_collected_output(status, buffer, acc, _on_message) do
+  defp finalize_collected_output(status, buffer, window, _on_message) do
     remaining = buffer |> to_string() |> String.trim()
     if remaining != "", do: log_stream_line(remaining)
-    tail = failure_tail(acc, remaining)
+    tail = failure_tail(window, remaining)
 
     # A CLI that was refused by its usage limit exits nonzero like any crash.
     # Saying so is what lets the orchestrator park the issue until the window
@@ -575,9 +646,9 @@ defmodule CymphonyElixir.Agent.Runner do
   # entry stores, `/api/v1/state` serves, the dashboard renders, and the tracker
   # abandonment comment publishes. `Agent.failure_excerpt/1` owns the bounding,
   # sanitizing, and redacting so the adapters' own exit-0 error payloads get
-  # exactly the same treatment. `acc` is already newest-first.
-  defp failure_tail(acc, remaining) do
-    Agent.failure_excerpt([remaining | acc])
+  # exactly the same treatment. The window is chronological, so reverse it.
+  defp failure_tail(window, remaining) do
+    Agent.failure_excerpt([remaining | Enum.reverse(OutputWindow.lines(window))])
   end
 
   # The harness ring is served by `GET /api/v1/:issue/harness` and rendered in
@@ -595,7 +666,7 @@ defmodule CymphonyElixir.Agent.Runner do
     on_message.(%{event: :harness_stdout, raw: raw, timestamp: DateTime.utc_now()})
   end
 
-  defp validate_workspace_cwd(workspace, nil, config) when is_binary(workspace) do
+  defp validate_workspace_cwd(workspace, nil, config, _opts) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
     expanded_root = Path.expand(if config, do: config.workspace.root, else: Config.settings!().workspace.root)
     expanded_root_prefix = expanded_root <> "/"
@@ -623,7 +694,7 @@ defmodule CymphonyElixir.Agent.Runner do
     end
   end
 
-  defp validate_workspace_cwd(workspace, worker_host, _config)
+  defp validate_workspace_cwd(workspace, worker_host, config, opts)
        when is_binary(workspace) and is_binary(worker_host) do
     cond do
       String.trim(workspace) == "" ->
@@ -633,7 +704,10 @@ defmodule CymphonyElixir.Agent.Runner do
         {:error, {:invalid_workspace_cwd, :invalid_remote_workspace, worker_host, workspace}}
 
       true ->
-        {:ok, workspace}
+        case Workspace.validate_remote_workspace(workspace, worker_host, config, true, opts) do
+          :ok -> {:ok, workspace}
+          {:error, reason} -> {:error, {:invalid_workspace_cwd, :remote_path, reason}}
+        end
     end
   end
 
@@ -670,7 +744,9 @@ defmodule CymphonyElixir.Agent.Runner do
   end
 
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do
-    message = metadata |> Map.merge(details) |> Map.put(:event, event) |> Map.put(:timestamp, DateTime.utc_now())
+    message =
+      metadata |> Map.merge(details) |> Map.put(:event, event) |> Map.put(:timestamp, DateTime.utc_now())
+
     on_message.(message)
   end
 

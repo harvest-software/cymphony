@@ -15,6 +15,7 @@ defmodule CymphonyElixirWeb.Control do
 
   alias CymphonyElixir.{Agent, Orchestrator, ProjectSupervisor}
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
+  alias CymphonyElixir.Cymphony.ShellProvider
   alias CymphonyElixir.Cymphony.WorkflowGenerator
   alias CymphonyElixir.Linear.Client, as: LinearClient
   alias CymphonyElixirWeb.Endpoint
@@ -51,7 +52,7 @@ defmodule CymphonyElixirWeb.Control do
   @spec resume(scope()) :: :ok | {:error, :not_found | term()}
   def resume(scope), do: apply_scope(scope, &Orchestrator.resume/1, &persist_dispatch_paused(&1, false))
 
-  @spec set_concurrency(scope(), pos_integer()) :: :ok | {:error, :not_found}
+  @spec set_concurrency(scope(), pos_integer()) :: :ok | {:error, term()}
   def set_concurrency(scope, n) when is_integer(n) and n > 0 do
     apply_scope(
       scope,
@@ -74,13 +75,17 @@ defmodule CymphonyElixirWeb.Control do
     end
   end
 
-  @spec set_providers(scope(), [String.t()]) :: :ok | {:error, :not_found}
+  @spec set_providers(scope(), [String.t()]) :: :ok | {:error, term()}
   def set_providers(scope, providers) when is_list(providers) do
-    apply_scope(
-      scope,
-      &Orchestrator.set_providers(&1, providers),
-      fn project -> CymphonyConfig.update_providers(project, providers) end
-    )
+    if providers != [] and Enum.all?(providers, &ShellProvider.valid_name?/1) do
+      apply_scope(
+        scope,
+        &Orchestrator.set_providers(&1, providers),
+        fn project -> CymphonyConfig.update_providers(project, providers) end
+      )
+    else
+      {:error, :invalid_providers}
+    end
   end
 
   @spec set_agent_settings(scope(), map()) :: :ok | {:error, :not_found | term()}
@@ -195,8 +200,8 @@ defmodule CymphonyElixirWeb.Control do
           {:ok, linear_status()} | {:error, :empty | :unauthorized | :invalid | term()}
   def connect_linear(api_key) when is_binary(api_key) do
     with {:ok, _viewer} <- LinearClient.validate_api_key(api_key),
-         {:ok, _config} <- CymphonyConfig.put_linear_api_key(api_key) do
-      rewrite_registered_workflows()
+         {:ok, _config} <- CymphonyConfig.put_linear_api_key(api_key),
+         :ok <- rewrite_registered_workflows() do
       {:ok, linear_status()}
     end
   end
@@ -396,89 +401,7 @@ defmodule CymphonyElixirWeb.Control do
   end
 
   defp persist_queue_pin(project, issue, pin) do
-    CymphonyConfig.update_project_queue(project, %{
-      "queue_pins" => next_queue_pins(project, issue, pin)
-    })
-  end
-
-  defp next_queue_pins(project, issue, pin) do
-    project
-    |> loaded_queue_pins()
-    |> overlay_queue_pin(issue, pin)
-  end
-
-  # `set_queue_pin/3` requires a named project scope, and the legacy fallback
-  # now keys its persist by that same name, so `project` is always a binary
-  # here — there is no "all projects" pin merge to handle.
-  defp loaded_queue_pins(project) when is_binary(project) do
-    case CymphonyConfig.load() do
-      {:ok, config} -> queue_pins_from_config(config, project)
-      _ -> %{}
-    end
-  end
-
-  defp queue_pins_from_config(config, name) do
-    case CymphonyConfig.find_project(config, name) do
-      {:ok, project} -> as_pin_map(Map.get(project, "queue_pins"))
-      _ -> %{}
-    end
-  end
-
-  defp as_pin_map(pins) when is_map(pins), do: pins
-  defp as_pin_map(_), do: %{}
-
-  defp overlay_queue_pin(pins, issue, pin) when is_map(pin) do
-    incoming = stringify_pin_map(pin)
-
-    if incoming == %{} do
-      Map.delete(pins, issue)
-    else
-      current =
-        case Map.get(pins, issue) do
-          map when is_map(map) -> stringify_pin_map(map)
-          _ -> %{}
-        end
-
-      Map.put(pins, issue, Map.merge(current, incoming))
-    end
-  end
-
-  # Both call sites are already guarded by `is_map/1`, so there is no fallback
-  # clause — dialyzer proves one unreachable.
-  defp stringify_pin_map(pin) do
-    %{}
-    |> put_string_pin_field(pin, [:agent_kind, "agent_kind", :kind, "kind"], "agent_kind")
-    |> put_string_pin_field(pin, [:model, "model"], "model")
-    |> put_string_pin_field(pin, [:effort, "effort"], "effort")
-  end
-
-  defp put_string_pin_field(acc, pin, keys, dest) do
-    case first_binary_from(pin, keys) do
-      nil ->
-        acc
-
-      value ->
-        case String.trim(value) do
-          "" -> acc
-          "keep" -> acc
-          trimmed -> maybe_put_string_pin_field(acc, dest, trimmed)
-        end
-    end
-  end
-
-  defp maybe_put_string_pin_field(acc, "agent_kind", kind) do
-    if Agent.known_kind?(kind), do: Map.put(acc, "agent_kind", kind), else: acc
-  end
-
-  defp maybe_put_string_pin_field(acc, key, value), do: Map.put(acc, key, value)
-
-  defp first_binary_from(pin, keys) do
-    Enum.find_value(keys, fn key ->
-      case Map.get(pin, key) do
-        value when is_binary(value) -> value
-        _ -> nil
-      end
-    end)
+    CymphonyConfig.update_project_queue_pin(project, issue, pin)
   end
 
   defp collect_queue_order_item(item, {:ok, acc}) when is_binary(item) do
@@ -549,15 +472,21 @@ defmodule CymphonyElixirWeb.Control do
   end
 
   defp start_added_project(project) do
-    {:ok, path} = WorkflowGenerator.write_temp(project)
+    temp_dir = Application.get_env(:cymphony_elixir, :workflow_temp_dir, System.tmp_dir!())
 
-    # Tests may pin {name, path} so start uses a memory-tracker workflow.
-    {start_name, start_path} =
-      Application.get_env(:cymphony_elixir, :start_project_args, {project["name"], path})
+    case WorkflowGenerator.write_temp(project, tmp_dir: temp_dir) do
+      {:ok, path} ->
+        # Tests may pin {name, path} so start uses a memory-tracker workflow.
+        {start_name, start_path} =
+          Application.get_env(:cymphony_elixir, :start_project_args, {project["name"], path})
 
-    case ProjectSupervisor.start_project(start_name, start_path) do
-      :ok -> {:ok, strip_linear_api_key(project)}
-      {:error, reason} -> {:error, {:project_start_failed, reason}}
+        case ProjectSupervisor.start_project(start_name, start_path) do
+          :ok -> {:ok, strip_linear_api_key(project)}
+          {:error, reason} -> {:error, {:project_start_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:workflow_write_failed, reason}}
     end
   end
 
@@ -568,8 +497,12 @@ defmodule CymphonyElixirWeb.Control do
   end
 
   defp rewrite_registered_workflows do
-    Enum.each(ProjectSupervisor.list_orchestrators(), fn {name, _pid} ->
-      _ = ProjectSupervisor.rewrite_workflow(name)
+    Enum.reduce(ProjectSupervisor.list_orchestrators(), :ok, fn {name, _pid}, acc ->
+      case ProjectSupervisor.rewrite_workflow(name) do
+        :ok -> acc
+        {:error, reason} when acc == :ok -> {:error, {:workflow_rewrite_failed, name, reason}}
+        {:error, _reason} -> acc
+      end
     end)
   end
 

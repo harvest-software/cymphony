@@ -13,7 +13,7 @@ defmodule CymphonyElixir.ProjectSupervisor do
   alias CymphonyElixir.Cymphony.WorkflowGenerator
   alias CymphonyElixir.{DependencyGate, Orchestrator, WorkflowStore}
 
-  @project_roles [:supervisor, :workflow_store, :orchestrator, :dependency_gate]
+  @project_roles [:supervisor, :workflow_store, :port_supervisor, :task_supervisor, :orchestrator, :dependency_gate]
   @unregister_poll_ms 5
   @unregister_budget_ms 1_000
 
@@ -34,14 +34,23 @@ defmodule CymphonyElixir.ProjectSupervisor do
     project_name = Keyword.fetch!(opts, :project_name)
     workflow_path = Keyword.fetch!(opts, :workflow_path)
 
+    orchestrator_opts = [
+      name: via_tuple(project_name, :orchestrator),
+      project_name: project_name,
+      task_supervisor: via_tuple(project_name, :task_supervisor),
+      port_supervisor: via_tuple(project_name, :port_supervisor)
+    ]
+
     children =
       dependency_gate_child(project_name) ++
         [
           {WorkflowStore, name: via_tuple(project_name, :workflow_store), workflow_path: workflow_path},
-          {Orchestrator, name: via_tuple(project_name, :orchestrator), project_name: project_name}
+          {DynamicSupervisor, name: via_tuple(project_name, :port_supervisor), strategy: :one_for_one},
+          {Task.Supervisor, name: via_tuple(project_name, :task_supervisor)},
+          {Orchestrator, orchestrator_opts}
         ]
 
-    Supervisor.init(children, strategy: :one_for_one)
+    Supervisor.init(children, strategy: :one_for_all)
   end
 
   # Started before the Orchestrator so the first poll tick can already get a

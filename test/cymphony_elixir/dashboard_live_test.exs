@@ -16,6 +16,9 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
   alias CymphonyElixir.Agent
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
+  alias CymphonyElixir.Cymphony.WorkflowGenerator
+  alias CymphonyElixir.ProjectSupervisor
+  alias CymphonyElixir.WorkflowStore
   alias CymphonyElixirWeb.Presenter
 
   @endpoint CymphonyElixirWeb.Endpoint
@@ -258,7 +261,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
         projects: patch_running(payload.projects, entry)
     }
 
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, patched})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, patched))
 
     html = render(view)
     assert html =~ "12.3 t/s"
@@ -434,6 +437,90 @@ defmodule CymphonyElixir.DashboardLiveTest do
     refute html =~ "lin_api_fake"
   end
 
+  test "project controls report applied but unpersisted changes without crashing" do
+    start_dashboard(recipient: self())
+    {:ok, view, _html} = live(build_conn(), "/")
+    config_path = Path.join(CymphonyConfig.config_dir(), "config.json")
+    File.rm!(config_path)
+
+    html = render_submit(view, "set_concurrency", %{"value" => "4"})
+    assert html =~ "Concurrency was applied, but could not be saved"
+    refute html =~ "Concurrency set to 4; persisted"
+    assert_receive {:orchestrator_call, {:set_concurrency, 4}}
+
+    html = render_submit(view, "set_project_concurrency", %{"project" => "default", "value" => "3"})
+    assert html =~ "Concurrency was applied, but could not be saved"
+    assert_receive {:orchestrator_call, {:set_concurrency, 3}}
+
+    html = render_submit(view, "set_project_providers", %{"project" => "default", "value" => "cv1,cz2"})
+    assert html =~ "Providers were applied, but could not be saved"
+    assert_receive {:orchestrator_call, {:set_providers, ["cv1", "cz2"]}}
+
+    html = render_submit(view, "set_project_agent", %{"project" => "default", "agent_kind" => "codex"})
+    assert html =~ "Agent settings were applied, but could not be fully saved"
+    assert_receive {:orchestrator_call, {:set_agent_settings, %{"agent" => "codex"}}}
+  end
+
+  test "project providers reject unsafe aliases without dispatch" do
+    start_dashboard(recipient: self())
+    {:ok, view, _html} = live(build_conn(), "/")
+
+    html = render_submit(view, "set_project_providers", %{"project" => "default", "value" => "cv1; echo bad"})
+    assert html =~ "Providers must be valid shell aliases"
+    refute_receive {:orchestrator_call, {:set_providers, _}}, 50
+  end
+
+  test "Linear connect reports a saved key with a failed workflow rewrite without leaking it" do
+    start_dashboard()
+    {:ok, view, _html} = live(build_conn(), "/")
+    tmp = CymphonyConfig.config_dir()
+    project = %{"name" => "default", "linear_project_slug" => "default-slug", "linear_api_key" => "lin_test"}
+    assert :ok = CymphonyConfig.save(%{"projects" => [project]})
+    workflow_dir = Path.join(tmp, "workflow")
+    File.mkdir_p!(workflow_dir)
+    workflow_path = Path.join(workflow_dir, "WORKFLOW.md")
+    File.write!(workflow_path, WorkflowGenerator.generate(project))
+
+    store_opts = [name: ProjectSupervisor.via_tuple("default", :workflow_store), workflow_path: workflow_path]
+
+    start_supervised!(%{
+      id: {:dashboard_failed_rewrite_store, "default"},
+      start: {WorkflowStore, :start_link, [store_opts]}
+    })
+
+    owner = self()
+
+    orch =
+      spawn(fn ->
+        {:ok, _} = Registry.register(CymphonyElixir.ProjectRegistry, {"default", :orchestrator}, nil)
+        send(owner, :orch_registered)
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive :orch_registered
+    on_exit(fn -> Process.exit(orch, :kill) end)
+    File.rm_rf!(workflow_dir)
+    stub_linear_graphql(&linear_success_request/2)
+
+    html = render_submit(view, "connect_linear", %{"api_key" => "lin_api_topsecret"})
+    assert html =~ "Linear key was saved, but a project workflow could not be updated"
+    assert view_assigns(view).linear_status.connected
+    refute html =~ "lin_api_topsecret"
+  end
+
+  test "add project reports generated workflow failure instead of crashing" do
+    start_dashboard()
+    {:ok, view, _html} = live(build_conn(), "/")
+    {:ok, config} = CymphonyConfig.load()
+    assert :ok = CymphonyConfig.save(Map.put(config, "linear_api_key", "lin_test"))
+    Application.put_env(:cymphony_elixir, :workflow_temp_dir, Path.join(CymphonyConfig.config_dir(), "missing"))
+    on_exit(fn -> Application.delete_env(:cymphony_elixir, :workflow_temp_dir) end)
+
+    html = render_submit(view, "add_project", %{"name" => "Farm", "linear_project_slug" => "farm-slug"})
+    assert html =~ "Project was saved but its workflow could not be generated"
+    refute html =~ "Farm added and started"
+  end
+
   test "header agent select id is stable and survives stale payload refresh" do
     start_dashboard()
     {:ok, view, html} = live(build_conn(), "/")
@@ -462,7 +549,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
     send(
       view.pid,
-      {:payload_loaded, preview_assigns.payload_seq, %{preview_payload | projects: [Map.put(preview_project, :agent_kind, "claude") | preview_rest]}}
+      test_payload_loaded(view, preview_assigns.payload_seq, %{preview_payload | projects: [Map.put(preview_project, :agent_kind, "claude") | preview_rest]})
     )
 
     render(view)
@@ -487,7 +574,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     [project | rest] = payload.projects
     assert project.agent_kind == "claude"
 
-    send(view.pid, {:payload_loaded, seq_after, payload})
+    send(view.pid, test_payload_loaded(view, seq_after, payload))
     render(view)
     assert has_element?(view, ~s|form[phx-submit="set_project_agent"] input[name="agent_kind"][value="codex"]|)
     refute has_element?(view, ~s|form[phx-submit="set_project_agent"] input[name="agent_kind"][value="claude"]|)
@@ -498,7 +585,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
       |> Map.put(:agent_model, nil)
       |> Map.put(:agent_effort, nil)
 
-    send(view.pid, {:payload_loaded, seq_before, %{payload | projects: [stale_project | rest]}})
+    send(view.pid, test_payload_loaded(view, seq_before, %{payload | projects: [stale_project | rest]}))
     render(view)
 
     assert has_element?(view, ~s|form[phx-submit="set_project_agent"] input[name="agent_kind"][value="codex"]|)
@@ -510,7 +597,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
       |> Map.put(:agent_model, "gpt-5.2-codex")
       |> Map.put(:agent_effort, "high")
 
-    send(view.pid, {:payload_loaded, seq_after, %{payload | projects: [matching_project | rest]}})
+    send(view.pid, test_payload_loaded(view, seq_after, %{payload | projects: [matching_project | rest]}))
     render(view)
 
     assert has_element?(view, ~s|form[phx-submit="set_project_agent"] input[name="agent_kind"][value="codex"]|)
@@ -589,7 +676,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
     send(
       view.pid,
-      {:payload_loaded, view_assigns(view).payload_seq, %{payload | projects: [Map.put(project, :agent_kind, nil) | rest]}}
+      test_payload_loaded(view, view_assigns(view).payload_seq, %{payload | projects: [Map.put(project, :agent_kind, nil) | rest]})
     )
 
     render(view)
@@ -598,7 +685,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
     send(
       view.pid,
-      {:payload_loaded, view_assigns(view).payload_seq, %{payload | projects: [Map.put(project, :agent_kind, "gemini") | rest]}}
+      test_payload_loaded(view, view_assigns(view).payload_seq, %{payload | projects: [Map.put(project, :agent_kind, "gemini") | rest]})
     )
 
     render(view)
@@ -662,7 +749,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
         projects: patch_running(payload.projects, entry)
     }
 
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, patched})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, patched))
 
     view
     |> element(~s|button[phx-click="toggle_logs"][phx-value-issue="MT-HTTP"]|)
@@ -769,7 +856,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     [project | _rest] = payload.projects
     other = %{project | name: "Other", max_concurrent_agents: 9}
 
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, %{payload | projects: [project, other]}})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, %{payload | projects: [project, other]}))
     render(view)
 
     # Projects disagree: prefilling either number would flatten the other on Set.
@@ -898,7 +985,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     {:ok, view, html} = live(build_conn(), "/")
     refute html =~ "fleet-empty"
 
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, %{projects: []}})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, %{projects: []}))
 
     assert has_element?(view, "section.section-card.fleet-empty .fleet-empty-label", "No projects")
     assert has_element?(view, ".fleet-empty-copy", "Connect Linear and add your first project.")
@@ -1330,7 +1417,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
       |> Map.put(:stalled, true)
       |> Map.put(:last_event_at, DateTime.to_iso8601(stalled_at))
 
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, %{payload | running: [stalled | rest]}})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, %{payload | running: [stalled | rest]}))
 
     html = render(view)
 
@@ -1372,7 +1459,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
         polling: %{payload.polling | next_poll_in_ms: nil}
     }
 
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, unclocked})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, unclocked))
 
     html = render(view)
 
@@ -1579,7 +1666,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     # slot: re-anchoring here would re-evaluate and re-serialize every project
     # header, queue card, session row and restart form — the exact re-render the
     # section split exists to skip.
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, payload})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, payload))
     render(view)
 
     assert view_assigns(view).now == now_before
@@ -1590,7 +1677,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     moved = %{entry | tokens: %{entry.tokens | total_tokens: entry.tokens.total_tokens + 1}}
     patched = %{payload | running: [moved | rest], projects: patch_running(payload.projects, moved)}
 
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, patched})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, patched))
     render(view)
 
     assert DateTime.compare(view_assigns(view).now, now_before) == :gt
@@ -1628,7 +1715,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
     # The throughput sparkline is seeded from the mount token sample and grows a
     # column on the first load, so take the baseline after one payload load.
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, Presenter.state_payload(orchestrator, 1_000)})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, Presenter.state_payload(orchestrator, 1_000)))
     render(view)
 
     assigns_before = view_assigns(view)
@@ -1643,16 +1730,16 @@ defmodule CymphonyElixir.DashboardLiveTest do
     # never includes an identical countdown, and the fixture freezes it.
     reloaded = Presenter.state_payload(orchestrator, 1_000)
     reloaded = %{reloaded | polling: %{reloaded.polling | next_poll_in_ms: 1_842}}
-    send(view.pid, {:payload_loaded, assigns_before.payload_seq, reloaded})
+    send(view.pid, test_payload_loaded(view, assigns_before.payload_seq, reloaded))
 
     assert render(view) == html_before
     assert view_payload(view) == payload_before
 
-    # `:token_samples` grows the throughput window; nothing else may move. Not
+    # Internal samples and the refresh timestamp move; no rendered section may. Not
     # one payload section, and not `:now` either — the per-project comprehension
     # reads `:now`, so re-anchoring it would re-serialize every project subtree
     # and put the whole board back on the wire for a poll that changed nothing.
-    assert changed_assign_keys(assigns_before, view_assigns(view)) -- [:token_samples] == []
+    assert changed_assign_keys(assigns_before, view_assigns(view)) -- [:token_samples, :last_payload_refresh] == []
   end
 
   test "a poll whose only movement is generated_at leaves every section assign untouched" do
@@ -1664,17 +1751,17 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
     {:ok, view, _html} = live(build_conn(), "/")
 
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, Presenter.state_payload(orchestrator, 1_000)})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, Presenter.state_payload(orchestrator, 1_000)))
     render(view)
 
     assigns_before = view_assigns(view)
     html_before = render(view)
 
     payload = Map.put(Presenter.state_payload(orchestrator, 1_000), :generated_at, "2026-08-16T00:00:00.000000Z")
-    send(view.pid, {:payload_loaded, assigns_before.payload_seq, payload})
+    send(view.pid, test_payload_loaded(view, assigns_before.payload_seq, payload))
 
     assert render(view) == html_before
-    assert changed_assign_keys(assigns_before, view_assigns(view)) -- [:token_samples] == []
+    assert changed_assign_keys(assigns_before, view_assigns(view)) -- [:token_samples, :last_payload_refresh] == []
   end
 
   test "a poll that only moves the countdown reassigns nothing at all" do
@@ -1685,7 +1772,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     # The throughput sparkline is seeded from the mount token sample and grows
     # its first column on the first load, so take the baseline after one load.
     payload = view_payload(view)
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, payload})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, payload))
     render(view)
 
     assigns_before = view_assigns(view)
@@ -1697,7 +1784,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     # no production payload load could ever ship an empty diff.
     ticked = %{payload | polling: %{payload.polling | next_poll_in_ms: 4_000}}
 
-    send(view.pid, {:payload_loaded, assigns_before.payload_seq, ticked})
+    send(view.pid, test_payload_loaded(view, assigns_before.payload_seq, ticked))
     render(view)
 
     assigns = view_assigns(view)
@@ -1705,7 +1792,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     assert assigns.polling == assigns_before.polling
     assert assigns.now == assigns_before.now
     assert assigns.projects == assigns_before.projects
-    assert changed_assign_keys(assigns_before, assigns) -- [:token_samples] == []
+    assert changed_assign_keys(assigns_before, assigns) -- [:token_samples, :last_payload_refresh] == []
   end
 
   test "a poll that stops scheduling, or starts checking, still reassigns :polling" do
@@ -1714,13 +1801,13 @@ defmodule CymphonyElixir.DashboardLiveTest do
     {:ok, view, _html} = live(build_conn(), "/")
 
     payload = view_payload(view)
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, payload})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, payload))
     render(view)
 
     # `nil` is not countdown drift: it means no poll is scheduled, which drops
     # the anchor attribute and renders `n/a`. That has to land.
     unscheduled = %{payload | polling: %{payload.polling | next_poll_in_ms: nil}}
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, unscheduled})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, unscheduled))
     render(view)
 
     assert view_assigns(view).polling.next_poll_in_ms == nil
@@ -1729,13 +1816,13 @@ defmodule CymphonyElixir.DashboardLiveTest do
     # and it is in the signature — which is what lands the refreshed countdown
     # twice per poll despite the drift being ignored.
     checking = %{payload | polling: %{payload.polling | checking?: true, next_poll_in_ms: nil}}
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, checking})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, checking))
     render(view)
 
     assert view_assigns(view).polling.checking? == true
 
     resumed = %{payload | polling: %{payload.polling | checking?: false, next_poll_in_ms: 29_000}}
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, resumed})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, resumed))
     render(view)
 
     assert view_assigns(view).polling.next_poll_in_ms == 29_000
@@ -1749,7 +1836,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     payload = view_payload(view)
     counts = %{payload.counts | running: 41}
 
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, %{payload | counts: counts}})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, %{payload | counts: counts}))
 
     render(view)
     assigns = view_assigns(view)
@@ -1780,7 +1867,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
       {:ok, view, _html} = live(build_conn(), "/")
 
       payload = view_payload(view)
-      send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, payload})
+      send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, payload))
       render(view)
 
       [entry | rest] = payload.running
@@ -1790,7 +1877,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
       assigns_before = view_assigns(view)
       patched = %{payload | running: [moved | rest], projects: patch_running(payload.projects, moved)}
 
-      send(view.pid, {:payload_loaded, assigns_before.payload_seq, patched})
+      send(view.pid, test_payload_loaded(view, assigns_before.payload_seq, patched))
 
       render(view)
       assigns = view_assigns(view)
@@ -1803,7 +1890,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
       # chip and the expanded `@ <timestamp>` from the last load that moved a
       # real field rather than re-rendering the whole board for a number the
       # server re-derived from nothing but the clock.
-      assert changed_assign_keys(assigns_before, assigns) -- [:token_samples] == []
+      assert changed_assign_keys(assigns_before, assigns) -- [:token_samples, :last_payload_refresh] == []
     end
   end
 
@@ -1813,7 +1900,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     {:ok, view, _html} = live(build_conn(), "/")
 
     payload = view_payload(view)
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, payload})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, payload))
     render(view)
 
     # `due_at` is an absolute time the presenter re-derives as `utc_now +
@@ -1831,7 +1918,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
     send(
       view.pid,
-      {:payload_loaded, assigns_before.payload_seq, %{payload | retrying: [moved | rest], projects: projects}}
+      test_payload_loaded(view, assigns_before.payload_seq, %{payload | retrying: [moved | rest], projects: projects})
     )
 
     render(view)
@@ -1839,7 +1926,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
     assert assigns.retrying == assigns_before.retrying
     assert assigns.projects == assigns_before.projects
-    assert changed_assign_keys(assigns_before, assigns) -- [:token_samples] == []
+    assert changed_assign_keys(assigns_before, assigns) -- [:token_samples, :last_payload_refresh] == []
   end
 
   test "a retry reschedule still lands because attempt moves with due_at" do
@@ -1851,7 +1938,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     [retry | rest] = payload.retrying
     rescheduled = retry |> Map.put(:attempt, retry.attempt + 1) |> Map.put(:due_at, "2026-08-16T00:00:09Z")
 
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, %{payload | retrying: [rescheduled | rest]}})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, %{payload | retrying: [rescheduled | rest]}))
 
     render(view)
 
@@ -1866,11 +1953,10 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
     send(
       view.pid,
-      {:payload_loaded, view_assigns(view).payload_seq,
-       %{
-         generated_at: "2026-08-16T00:00:00Z",
-         error: %{code: "snapshot_timeout", message: "Snapshot timed out"}
-       }}
+      test_payload_loaded(view, view_assigns(view).payload_seq, %{
+        generated_at: "2026-08-16T00:00:00Z",
+        error: %{code: "snapshot_timeout", message: "Snapshot timed out"}
+      })
     )
 
     html = render(view)
@@ -1898,7 +1984,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     payload = view_payload(view)
     stale_seq = view_assigns(view).payload_seq - 1
 
-    send(view.pid, {:payload_loaded, stale_seq, %{payload | counts: %{payload.counts | running: 99}}})
+    send(view.pid, test_payload_loaded(view, stale_seq, %{payload | counts: %{payload.counts | running: 99}}))
 
     render(view)
     assert view_assigns(view).counts == payload.counts
@@ -1928,7 +2014,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
       # runs. The typed value must still be what the input renders.
       payload = view_payload(view)
       counts = %{payload.counts | running: payload.counts.running + 1}
-      send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, %{payload | counts: counts}})
+      send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, %{payload | counts: counts}))
 
       html = render(view)
 
@@ -1975,7 +2061,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
 
     payload = view_payload(view)
     counts = %{payload.counts | running: payload.counts.running + 1}
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, %{payload | counts: counts}})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, %{payload | counts: counts}))
 
     html = render(view)
     assigns = view_assigns(view)
@@ -2086,7 +2172,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     # Park the periodic reload far away so nothing but the measured event can
     # produce a diff.
     view |> form(~s|form[phx-submit="set_refresh_interval"]|, %{value: "600"}) |> render_submit()
-    send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, view_payload(view)})
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, view_payload(view)))
     render(view)
 
     :erlang.trace(view.pid, true, [:send])
@@ -2101,7 +2187,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
         payload = view_payload(view)
         ticked = %{payload | polling: %{payload.polling | next_poll_in_ms: 3_137}}
 
-        send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, ticked})
+        send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, ticked))
       end)
 
     # An unchanged load must produce an *empty* diff — LiveView skips the morph
@@ -2116,7 +2202,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
         moved = Map.put(entry, :last_event_at, "2026-08-16T00:00:00Z")
         patched = %{payload | running: [moved | rest], projects: patch_running(payload.projects, moved)}
 
-        send(view.pid, {:payload_loaded, view_assigns(view).payload_seq, patched})
+        send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, patched))
       end)
 
     assert heartbeat_bytes == 0
@@ -2158,6 +2244,182 @@ defmodule CymphonyElixir.DashboardLiveTest do
     assert byte_size(harness_diff) < div(byte_size(full_html), 50)
 
     :erlang.trace(view.pid, false, [:send])
+  end
+
+  @tag queue_diff: true
+  test "a queue title update does not repaint session controls or clocks for concurrent volatile drift" do
+    start_dashboard(snapshot: Map.put(static_snapshot(), :waiting, [waiting_snapshot_entry(%{identifier: "DIFF-1"})]))
+    {:ok, view, _html} = live(build_conn(), "/")
+    view |> form(~s|form[phx-submit="set_refresh_interval"]|, %{value: "600"}) |> render_submit()
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, view_payload(view)))
+    render(view)
+
+    view
+    |> element(~s|button[phx-click="toggle_logs"][phx-value-issue="MT-HTTP"]|)
+    |> render_click()
+
+    payload = view_payload(view)
+    now_before = view_assigns(view).now
+    [running] = payload.running
+    [retrying] = payload.retrying
+    running = Map.merge(running, %{last_event_at: "2026-09-25T00:00:00Z", tokens_per_second: 987.0})
+    retrying = Map.put(retrying, :due_at, "2026-09-25T00:00:01Z")
+
+    projects =
+      payload.projects
+      |> patch_waiting_title("DIFF-1", "Only this title changed")
+      |> patch_running(running)
+      |> Enum.map(&%{&1 | retrying: [retrying]})
+
+    drifted = %{
+      payload
+      | projects: projects,
+        running: [running],
+        retrying: [retrying],
+        polling: %{payload.polling | next_poll_in_ms: 3_137}
+    }
+
+    :erlang.trace(view.pid, true, [:send])
+
+    diff =
+      capture_diff_text(view, fn ->
+        send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, drifted))
+      end)
+
+    assert diff =~ "Only this title changed"
+    refute diff =~ "spec-switcher"
+    refute diff =~ "data-base-seconds"
+    refute diff =~ "data-remaining-ms"
+    refute diff =~ "session-row"
+    assert byte_size(diff) < 512
+    assert view_assigns(view).now == now_before
+    assert has_element?(view, "#queue-card-default-DIFF-1 .queue-card-title", "Only this title changed")
+    :erlang.trace(view.pid, false, [:send])
+
+    # A real retry update still lands, including its fresh clock anchor.
+    retrying = %{retrying | attempt: 3}
+    projects = Enum.map(projects, &%{&1 | retrying: [retrying]})
+    changed = %{drifted | projects: projects, retrying: [retrying]}
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, changed))
+    render(view)
+    assert DateTime.compare(view_assigns(view).now, now_before) == :gt
+    assert has_element?(view, ".retry-row .chip--warn", "Attempt 3")
+  end
+
+  for queue_size <- [3, 100] do
+    @tag queue_diff: true
+    test "a #{queue_size}-card queue patches one title and preserves its keyed editor on reorder" do
+      waiting =
+        for rank <- 1..unquote(queue_size) do
+          waiting_snapshot_entry(%{
+            identifier: "DIFF-#{rank}",
+            title: "Unchanged queue title #{rank}",
+            agent_kind: "codex",
+            model: "gpt-5.2-codex",
+            effort: "high"
+          })
+        end
+
+      start_dashboard(snapshot: Map.put(static_snapshot(), :waiting, waiting))
+      {:ok, view, _html} = live(build_conn(), "/")
+      view |> form(~s|form[phx-submit="set_refresh_interval"]|, %{value: "600"}) |> render_submit()
+      send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, view_payload(view)))
+      render(view)
+
+      view
+      |> element(~s|button.queue-card-edit-toggle[phx-value-issue="DIFF-2"]|)
+      |> render_click()
+
+      render_change(view, "preview_queue_run_spec", %{
+        "project" => "default",
+        "issue" => "DIFF-2",
+        "agent_kind" => "codex",
+        "model" => "unsaved-model",
+        "effort" => "low"
+      })
+
+      editor = "#queue-edit-default-DIFF-2"
+      editor_before = view |> element(editor) |> render()
+      draft_before = view_assigns(view).queue_run_spec_drafts
+      assert has_element?(view, ~s|#{editor} #queue-model-DIFF-2[value="unsaved-model"]|)
+      assert has_element?(view, ~s|#{editor} #spec-switcher-queue-agent-DIFF-2[phx-hook="SpecSwitcher"]|)
+
+      :erlang.trace(view.pid, true, [:send])
+
+      # Cover both a sibling card changing and the card owning the open editor.
+      # Queue size must not affect the patch: serializing unchanged rows or the
+      # editor would reset client-owned switcher state during observation loads.
+      for identifier <- ["DIFF-1", "DIFF-2"] do
+        title = "Changed title #{identifier}"
+
+        diff =
+          capture_diff_text(view, fn ->
+            payload = view_payload(view)
+
+            projects = patch_waiting_title(payload.projects, identifier, title)
+
+            send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, %{payload | projects: projects}))
+          end)
+
+        assert diff =~ title
+        refute diff =~ "Unchanged queue title"
+        refute diff =~ "queue-card"
+        refute diff =~ "queue-edit"
+        refute diff =~ "spec-switcher"
+        refute diff =~ "combobox"
+        refute diff =~ "unsaved-model"
+        refute diff =~ "session-row"
+        assert byte_size(diff) < 512
+
+        assert has_element?(view, "#queue-card-default-#{identifier} .queue-card-title", title)
+        assert view |> element(editor) |> render() == editor_before
+        assert view_assigns(view).queue_run_spec_drafts == draft_before
+        assert view_assigns(view).queue_edit_ids == MapSet.new([{"default", "DIFF-2"}])
+      end
+
+      # Move the edited card into the Next position. Stable keys must move its
+      # existing edit subtree, not serialize a replacement switcher or lose the
+      # unsaved draft. This also exercises the rank badge's template boundary.
+      reordered =
+        capture_diff_text(view, fn ->
+          payload = view_payload(view)
+
+          projects =
+            Enum.map(payload.projects, fn project ->
+              [first | rest] = project.waiting
+              %{project | waiting: rest ++ [first]}
+            end)
+
+          send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, %{payload | projects: projects}))
+        end)
+
+      refute reordered =~ "Unchanged queue title"
+      refute reordered =~ "Changed title"
+      refute reordered =~ "spec-switcher"
+      refute reordered =~ "unsaved-model"
+      assert view |> element(editor) |> render() == editor_before
+      assert view_assigns(view).queue_run_spec_drafts == draft_before
+      assert view_assigns(view).queue_edit_ids == MapSet.new([{"default", "DIFF-2"}])
+      assert has_element?(view, ~s|#queue-card-default-DIFF-2[data-rank="0"] .queue-next-badge|)
+      refute has_element?(view, ~s|#queue-card-default-DIFF-2 .queue-next-badge[style*="display: none"]|)
+      assert has_element?(view, ~s|#queue-card-default-DIFF-1 .queue-next-badge[style="display: none"]|)
+
+      order =
+        view
+        |> element("#queue-board-default")
+        |> render()
+        |> Floki.parse_fragment!()
+        |> Floki.find(".queue-card")
+        |> Floki.attribute("data-issue")
+
+      assert order == Enum.map(2..unquote(queue_size), &"DIFF-#{&1}") ++ ["DIFF-1"]
+
+      assert measure_diff_bytes(view, fn ->
+               send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, view_payload(view)))
+             end) == 0
+
+      :erlang.trace(view.pid, false, [:send])
+    end
   end
 
   # Assign keys whose value moved between two snapshots of the socket. LiveView
@@ -2375,7 +2637,8 @@ defmodule CymphonyElixir.DashboardLiveTest do
   # right, the wire was not. Requires `:erlang.trace(view.pid, true, [:send])`.
   defp measure_diff_bytes(view, fun), do: byte_size(capture_diff_text(view, fun))
 
-  # The diff itself, so a test can assert on *what* was resent and not only on
+  # JSON-encoded diff bytes (never inspect/1, which truncates large payloads),
+  # so a test can assert on *what* was resent and not only on
   # how much. `byte_size(a) + byte_size(b) == byte_size(a <> b)`, so this is the
   # same number `measure_diff_bytes/2` always reported.
   defp capture_diff_text(view, fun) do
@@ -2388,7 +2651,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
   defp drain_diff_text(acc) do
     receive do
       {:trace, _pid, :send, %Phoenix.Socket.Message{event: "diff", payload: payload}, _to} ->
-        drain_diff_text(acc <> inspect(payload))
+        drain_diff_text(acc <> Jason.encode!(payload))
 
       {:trace, _pid, :send, _msg, _to} ->
         drain_diff_text(acc)
@@ -2410,9 +2673,31 @@ defmodule CymphonyElixir.DashboardLiveTest do
     :ok
   end
 
+  # Deliver through the real task-result handler with a matching active job.
+  # A stale sequence gets an unknown ref and cannot replace the current view.
+  defp test_payload_loaded(view, seq, payload) do
+    assigns = view_assigns(view)
+    ref = make_ref()
+
+    if seq == assigns.payload_seq do
+      :sys.replace_state(view.pid, fn %{socket: socket} = state ->
+        job = %{
+          ref: ref,
+          pid: nil,
+          task: nil,
+          generation: socket.assigns.payload_generation,
+          timer_ref: make_ref()
+        }
+
+        %{state | socket: %{socket | assigns: Map.put(socket.assigns, :payload_job, job)}}
+      end)
+    end
+
+    {ref, payload}
+  end
+
   # The LiveView keeps one assign per payload section instead of a single
-  # `:payload` map, so rebuild the payload shape the `{:payload_loaded, seq,
-  # payload}` contract still carries.
+  # `:payload` map, so rebuild the payload shape used by test snapshots.
   defp view_payload(view) do
     assigns = view_assigns(view)
 
@@ -2426,6 +2711,18 @@ defmodule CymphonyElixir.DashboardLiveTest do
       projects: assigns.projects,
       recent_completed: assigns.completions
     }
+  end
+
+  defp patch_waiting_title(projects, identifier, title) do
+    Enum.map(projects, fn project ->
+      %{project | waiting: patch_waiting_entries(project.waiting, identifier, title)}
+    end)
+  end
+
+  defp patch_waiting_entries(waiting, identifier, title) do
+    Enum.map(waiting, fn entry ->
+      if entry.issue_identifier == identifier, do: %{entry | issue_title: title}, else: entry
+    end)
   end
 
   defp patch_running(projects, entry) do

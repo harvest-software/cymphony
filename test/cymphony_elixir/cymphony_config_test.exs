@@ -85,6 +85,10 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
       assert CymphonyConfig.parse_providers_csv(123) == {:error, :empty}
       assert CymphonyConfig.parse_providers_csv(["cv1"]) == {:error, :empty}
     end
+
+    test "rejects aliases unsafe for shell function invocation" do
+      assert CymphonyConfig.parse_providers_csv("cz,$(touch /tmp/unsafe)") == {:error, :invalid}
+    end
   end
 
   describe "to_schema_map/1" do
@@ -370,7 +374,7 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
 
     test "github_repo_url adds an after_create clone hook; absence omits hooks" do
       with_repo = CymphonyConfig.to_schema_map(%{"github_repo_url" => "git@github.com:me/repo.git"})
-      assert with_repo["hooks"]["after_create"] =~ "git clone --depth 1 https://github.com/me/repo.git"
+      assert with_repo["hooks"]["after_create"] =~ "git clone --depth 1 -- 'https://github.com/me/repo.git' ."
 
       refute Map.has_key?(CymphonyConfig.to_schema_map(%{}), "hooks")
       refute Map.has_key?(CymphonyConfig.to_schema_map(%{"github_repo_url" => ""}), "hooks")
@@ -390,7 +394,7 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
 
       hooks = CymphonyConfig.to_schema_map(config)["hooks"]
 
-      assert hooks["after_create"] =~ "git clone --depth 1 https://gitlab.example.com/group/repo.git ."
+      assert hooks["after_create"] =~ "git clone --depth 1 -- 'https://gitlab.example.com/group/repo.git' ."
       assert hooks["before_run"] == "bash scripts/agent-stack.sh prepare"
       assert hooks["after_run"] == "./build.sh down"
       assert hooks["before_remove"] == "bash scripts/agent-stack.sh remove"
@@ -444,7 +448,7 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
       log =
         capture_log(fn ->
           hooks = CymphonyConfig.to_schema_map(%{"repo_url" => "https://github.com/me/repo.git", "hooks" => %{"after_create" => ""}})["hooks"]
-          assert hooks["after_create"] =~ "git clone --depth 1 https://github.com/me/repo.git ."
+          assert hooks["after_create"] =~ "git clone --depth 1 -- 'https://github.com/me/repo.git' ."
           refute hooks["after_create"] =~ "&&"
         end)
 
@@ -453,11 +457,11 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
 
     test "a repo URL that is not an scp-style git@ remote is cloned verbatim" do
       https = CymphonyConfig.to_schema_map(%{"github_repo_url" => "  https://github.com/me/repo.git  "})
-      assert https["hooks"]["after_create"] =~ "git clone --depth 1 https://github.com/me/repo.git ."
+      assert https["hooks"]["after_create"] =~ "git clone --depth 1 -- 'https://github.com/me/repo.git' ."
       refute https["hooks"]["after_create"] =~ "  https://"
 
       ssh_url = CymphonyConfig.to_schema_map(%{"repo_url" => "ssh://git@gitlab.example.com/group/repo.git"})
-      assert ssh_url["hooks"]["after_create"] =~ "git clone --depth 1 ssh://git@gitlab.example.com/group/repo.git"
+      assert ssh_url["hooks"]["after_create"] =~ "git clone --depth 1 -- 'ssh://git@gitlab.example.com/group/repo.git'"
     end
 
     test "the scp-style rewrite is host-agnostic, so GitLab clones over HTTPS too" do
@@ -481,7 +485,7 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
       ssh = %{"repo_url" => "git@gitlab.example.com:group/sub/repo.git", "rewrite_ssh_remote" => false}
 
       assert CymphonyConfig.to_schema_map(ssh)["hooks"]["after_create"] =~
-               "git clone --depth 1 git@gitlab.example.com:group/sub/repo.git ."
+               "git clone --depth 1 -- 'git@gitlab.example.com:group/sub/repo.git' ."
 
       refute CymphonyConfig.to_schema_map(ssh)["hooks"]["after_create"] =~ "https://"
 
@@ -524,6 +528,18 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
         log = capture_log(fn -> assert CymphonyConfig.to_schema_map(%{"forge" => bad})["forge"] == "github" end)
         if bad != nil, do: assert(log =~ "Ignoring unknown forge")
       end
+    end
+
+    test "clone hook quotes URL as one operand and prevents option parsing" do
+      url = "--upload-pack=$(touch /tmp/cymphony-unsafe)"
+      hook = CymphonyConfig.to_schema_map(%{"github_repo_url" => url})["hooks"]["after_create"]
+      assert hook =~ "git clone --depth 1 -- '--upload-pack=$(touch /tmp/cymphony-unsafe)' ."
+      refute hook =~ "--depth 1 --upload-pack"
+      assert {_, 0} = System.cmd("sh", ["-n", "-c", hook])
+
+      quoted = "https://example.test/a b'c.git"
+      hook = CymphonyConfig.to_schema_map(%{"github_repo_url" => quoted})["hooks"]["after_create"]
+      assert hook =~ "git clone --depth 1 -- 'https://example.test/a b'\"'\"'c.git' ."
     end
   end
 

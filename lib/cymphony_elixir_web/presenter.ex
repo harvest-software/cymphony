@@ -9,11 +9,14 @@ defmodule CymphonyElixirWeb.Presenter do
   def state_payload(orchestrator, snapshot_timeout_ms) do
     generated_at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
 
-    project_snapshots = aggregate_project_snapshots(snapshot_timeout_ms)
+    {project_count, project_snapshots} = aggregate_project_snapshots(snapshot_timeout_ms)
 
     case project_snapshots do
-      [] ->
+      [] when project_count == 0 ->
         legacy_payload(orchestrator, snapshot_timeout_ms, generated_at)
+
+      [] ->
+        %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
 
       snapshots ->
         merged = merge_project_snapshots(snapshots)
@@ -90,22 +93,21 @@ defmodule CymphonyElixirWeb.Presenter do
     }
   end
 
-  @spec projects_payload() :: [map()]
+  @spec projects_payload() :: [map()] | {:error, :snapshot_unavailable}
   def projects_payload do
-    ProjectSupervisor.list_orchestrators()
-    |> Enum.map(fn {project_name, pid} ->
-      case Orchestrator.snapshot(pid, 5_000) do
-        %{} = snapshot ->
-          %{
-            name: project_name,
-            running: length(snapshot.running),
-            retrying: length(snapshot.retrying)
-          }
+    {count, snapshots} = aggregate_project_snapshots(5_000)
 
-        _ ->
-          %{name: project_name, running: 0, retrying: 0}
-      end
-    end)
+    if count > 0 and snapshots == [] do
+      {:error, :snapshot_unavailable}
+    else
+      Enum.map(snapshots, fn %{project_name: project_name, snapshot: snapshot} ->
+        %{
+          name: project_name,
+          running: length(snapshot.running),
+          retrying: length(snapshot.retrying)
+        }
+      end)
+    end
   end
 
   def issue_payload(issue_identifier, orchestrator, snapshot_timeout_ms, project_name \\ nil)
@@ -159,15 +161,15 @@ defmodule CymphonyElixirWeb.Presenter do
   defp maybe_issue_payload_from_snapshot(%{} = snapshot, issue_identifier) do
     running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
     retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
-    issue_payload_from_entries(issue_identifier, running, retry)
+    issue_payload_from_entries(issue_identifier, running, retry, snapshot)
   end
 
   defp maybe_issue_payload_from_snapshot(_snapshot, _issue_identifier), do: nil
 
-  defp issue_payload_from_entries(_issue_identifier, nil, nil), do: nil
+  defp issue_payload_from_entries(_issue_identifier, nil, nil, _snapshot), do: nil
 
-  defp issue_payload_from_entries(issue_identifier, running, retry) do
-    {:ok, issue_payload_body(issue_identifier, running, retry)}
+  defp issue_payload_from_entries(issue_identifier, running, retry, snapshot) do
+    {:ok, issue_payload_body(issue_identifier, running, retry, snapshot)}
   end
 
   @spec refresh_payload(GenServer.name()) :: {:ok, map()} | {:error, :unavailable}
@@ -265,13 +267,13 @@ defmodule CymphonyElixirWeb.Presenter do
 
   defp map_value(_map, _keys), do: nil
 
-  defp issue_payload_body(issue_identifier, running, retry) do
+  defp issue_payload_body(issue_identifier, running, retry, snapshot) do
     %{
       issue_identifier: issue_identifier,
       issue_id: issue_id_from_entries(running, retry),
       status: issue_status(running, retry),
       workspace: %{
-        path: workspace_path(issue_identifier, running, retry),
+        path: workspace_path(issue_identifier, running, retry, snapshot),
         host: workspace_host(running, retry)
       },
       attempts: %{
@@ -300,7 +302,7 @@ defmodule CymphonyElixirWeb.Presenter do
   defp issue_status(nil, _retry), do: "retrying"
   defp issue_status(_running, _retry), do: "running"
 
-  defp running_entry_payload(entry) do
+  defp running_entry_payload(entry, stall_timeout_ms) do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
@@ -321,7 +323,7 @@ defmodule CymphonyElixirWeb.Presenter do
       last_message: summarize_message(entry.last_agent_message),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_agent_timestamp),
-      stalled: stalled?(entry.last_agent_timestamp),
+      stalled: stalled?(entry.last_agent_timestamp, stall_timeout_ms),
       log_events: Enum.take(Map.get(entry, :log_events, []), 20),
       project_name: Map.get(entry, :project_name),
       tokens: %{
@@ -398,7 +400,7 @@ defmodule CymphonyElixirWeb.Presenter do
     running =
       snapshot.running
       |> Enum.map(&Map.put(&1, :project_name, project_name))
-      |> Enum.map(&running_entry_payload/1)
+      |> Enum.map(&running_entry_payload(&1, Map.get(snapshot, :stall_timeout_ms)))
 
     retrying =
       snapshot.retrying
@@ -473,10 +475,10 @@ defmodule CymphonyElixirWeb.Presenter do
     }
   end
 
-  defp workspace_path(issue_identifier, running, retry) do
+  defp workspace_path(issue_identifier, running, retry, snapshot) do
     (running && Map.get(running, :workspace_path)) ||
       (retry && Map.get(retry, :workspace_path)) ||
-      Path.join(Config.settings!().workspace.root, issue_identifier)
+      Path.join(Map.get(snapshot, :workspace_root) || Config.settings!().workspace.root, issue_identifier)
   end
 
   defp workspace_host(running, retry) do
@@ -502,15 +504,15 @@ defmodule CymphonyElixirWeb.Presenter do
     }
   end
 
-  defp stalled?(%DateTime{} = last_event_at) do
-    timeout_ms = Config.settings!().agent.stall_timeout_ms
+  defp stalled?(%DateTime{} = last_event_at, configured_timeout_ms) do
+    timeout_ms = configured_timeout_ms || Config.settings!().agent.stall_timeout_ms
     elapsed_ms = DateTime.diff(DateTime.utc_now(), last_event_at, :millisecond)
-    elapsed_ms > timeout_ms
+    timeout_ms > 0 and elapsed_ms > timeout_ms
   rescue
     _ -> false
   end
 
-  defp stalled?(_), do: false
+  defp stalled?(_, _), do: false
 
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_agent_message(message)
@@ -622,19 +624,88 @@ defmodule CymphonyElixirWeb.Presenter do
   end
 
   defp aggregate_project_snapshots(snapshot_timeout_ms) do
-    ProjectSupervisor.list_orchestrators()
-    |> Enum.flat_map(fn {project_name, pid} ->
-      try do
-        case Orchestrator.snapshot(pid, snapshot_timeout_ms) do
-          %{} = snapshot ->
-            [%{project_name: project_name, snapshot: snapshot}]
+    projects = ProjectSupervisor.list_orchestrators()
+    deadline = System.monotonic_time(:millisecond) + snapshot_timeout_ms
 
-          _ ->
-            []
-        end
-      catch
-        :exit, _ -> []
+    snapshots =
+      projects
+      |> Enum.with_index()
+      |> collect_project_snapshots(%{}, [], deadline)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(&elem(&1, 1))
+
+    {length(projects), snapshots}
+  end
+
+  defp collect_project_snapshots(queued, active, results, deadline) do
+    {queued, active} = start_snapshot_tasks(queued, active, deadline)
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if map_size(active) == 0 or remaining <= 0 do
+      stop_snapshot_tasks(active)
+      results
+    else
+      receive do
+        {:snapshot_result, worker, snapshot} when is_map_key(active, worker) ->
+          {ref, index, name} = Map.fetch!(active, worker)
+          Process.demonitor(ref, [:flush])
+
+          results =
+            if is_map(snapshot),
+              do: [{index, %{project_name: name, snapshot: snapshot}} | results],
+              else: results
+
+          collect_project_snapshots(queued, Map.delete(active, worker), results, deadline)
+
+        {:DOWN, _ref, :process, worker, _reason} when is_map_key(active, worker) ->
+          collect_project_snapshots(queued, Map.delete(active, worker), results, deadline)
+      after
+        remaining ->
+          stop_snapshot_tasks(active)
+          results
       end
+    end
+  end
+
+  defp start_snapshot_tasks([{{name, pid}, index} | rest], active, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if map_size(active) < 4 and remaining > 0 do
+      owner = self()
+
+      try do
+        {worker, ref} =
+          spawn_monitor(fn ->
+            worker = self()
+
+            spawn(fn ->
+              owner_ref = Process.monitor(owner)
+              worker_ref = Process.monitor(worker)
+
+              receive do
+                {:DOWN, ^owner_ref, :process, _pid, _reason} -> Process.exit(worker, :kill)
+                {:DOWN, ^worker_ref, :process, _pid, _reason} -> :ok
+              end
+            end)
+
+            send(owner, {:snapshot_result, self(), Orchestrator.snapshot(pid, remaining)})
+          end)
+
+        start_snapshot_tasks(rest, Map.put(active, worker, {ref, index, name}), deadline)
+      rescue
+        _error -> start_snapshot_tasks(rest, active, deadline)
+      end
+    else
+      {[{{name, pid}, index} | rest], active}
+    end
+  end
+
+  defp start_snapshot_tasks(queued, active, _deadline), do: {queued, active}
+
+  defp stop_snapshot_tasks(active) do
+    Enum.each(active, fn {worker, {ref, _index, _name}} ->
+      Process.exit(worker, :kill)
+      Process.demonitor(ref, [:flush])
     end)
   end
 

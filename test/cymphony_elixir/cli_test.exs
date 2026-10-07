@@ -428,7 +428,10 @@ defmodule CymphonyElixir.CLIAgentOverrideTest do
       # orchestrator into every later test.
       _ = ProjectSupervisor.stop_project("Farm")
       Application.delete_env(:cymphony_elixir, :config_dir_override)
-      File.rm_rf!(tmp)
+      # The project's DependencyGate may still have a `git clone` of its mirror
+      # running under `tmp/repos`; that OS process outlives the gate, so a
+      # strict rm_rf! races it.
+      File.rm_rf(tmp)
     end)
 
     :ok
@@ -511,7 +514,10 @@ defmodule CymphonyElixir.CLIDaemonPidfileTest do
     on_exit(fn ->
       _ = ProjectSupervisor.stop_project("Farm")
       Application.delete_env(:cymphony_elixir, :config_dir_override)
-      File.rm_rf!(tmp)
+      # The project's DependencyGate may still have a `git clone` of its mirror
+      # running under `tmp/repos`; that OS process outlives the gate, so a
+      # strict rm_rf! races it.
+      File.rm_rf(tmp)
     end)
 
     {:ok, tmp: tmp}
