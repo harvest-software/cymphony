@@ -391,6 +391,58 @@ defmodule CymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec queue_add(Conn.t(), map()) :: Conn.t()
+  def queue_add(conn, params) do
+    with {:ok, project} <- required_project(params),
+         {:ok, issue} <- issue_param(params) do
+      case Control.add_manual_issue(project, issue) do
+        {:ok, added} ->
+          conn
+          |> put_status(202)
+          |> json(%{issue: added.identifier, issue_id: added.id, state: added.state, title: added.title, project: project})
+
+        {:error, reason} ->
+          manual_issue_error(conn, reason)
+      end
+    else
+      :error -> error_response(conn, 422, "invalid_queue_add", "query param 'project' and body field 'issue' are required")
+    end
+  end
+
+  @spec queue_remove(Conn.t(), map()) :: Conn.t()
+  def queue_remove(conn, params) do
+    with {:ok, project} <- required_project(params),
+         {:ok, issue} <- issue_param(params) do
+      case Control.remove_manual_issue(project, issue) do
+        :ok -> conn |> put_status(202) |> json(%{issue: issue, removed: true, project: project})
+        {:error, reason} -> manual_issue_error(conn, reason)
+      end
+    else
+      :error -> error_response(conn, 422, "invalid_queue_remove", "query param 'project' and body field 'issue' are required")
+    end
+  end
+
+  defp issue_param(%{"issue" => issue}) when is_binary(issue) do
+    case String.trim(issue) do
+      "" -> :error
+      trimmed -> {:ok, trimmed}
+    end
+  end
+
+  defp issue_param(_params), do: :error
+
+  defp manual_issue_error(conn, :not_found), do: error_response(conn, 422, "project_not_found", "Project not found")
+  defp manual_issue_error(conn, :issue_not_found), do: error_response(conn, 422, "issue_not_found", "The tracker has no such issue")
+  defp manual_issue_error(conn, :not_manual), do: error_response(conn, 422, "not_manual", "That issue was not added by hand")
+
+  defp manual_issue_error(conn, {:issue_terminal, state}),
+    do: error_response(conn, 422, "issue_terminal", "The issue is already #{state}")
+
+  defp manual_issue_error(conn, {:state_update_failed, reason}),
+    do: error_response(conn, 422, "state_update_failed", "Could not move the issue to a queued state: #{inspect(reason)}")
+
+  defp manual_issue_error(conn, reason), do: error_response(conn, 422, "queue_add_failed", inspect(reason))
+
   @spec method_not_allowed(Conn.t(), map()) :: Conn.t()
   def method_not_allowed(conn, _params) do
     error_response(conn, 405, "method_not_allowed", "Method not allowed")

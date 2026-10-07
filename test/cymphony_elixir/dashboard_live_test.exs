@@ -1202,6 +1202,84 @@ defmodule CymphonyElixir.DashboardLiveTest do
     refute has_element?(view, ~s|.retry-row--held span[data-clock="due"]|)
   end
 
+  test "a usage-limited retry says so on the row and in the project header" do
+    snapshot = static_snapshot()
+    resets_at = ~U[2026-10-07 00:30:00Z]
+
+    retrying =
+      Enum.map(snapshot.retrying, &Map.merge(&1, %{usage_limited_until: resets_at, resumable: true, error: "usage limit reached"}))
+
+    snapshot =
+      snapshot
+      |> Map.put(:retrying, retrying)
+      |> Map.put(:usage_limits, [%{agent_kind: "claude", provider: nil, resets_at: resets_at}])
+
+    start_dashboard(snapshot: snapshot)
+    {:ok, view, html} = live(build_conn(), "/")
+
+    assert has_element?(view, "article.retry-row span.chip.chip--limit", "Usage limit")
+    assert has_element?(view, "article.retry-row span.chip.chip--muted", "Resumes")
+    assert has_element?(view, "h2.project-section-name span.chip.chip--limit", "Usage limit · until 00:30 UTC")
+    assert html =~ "claude/default resets 2026-10-07T00:30:00Z"
+    assert html =~ "once the usage limit resets"
+  end
+
+  test "an issue queued by hand is marked and can be removed" do
+    snapshot =
+      static_snapshot()
+      |> Map.put(:waiting, [waiting_snapshot_entry(%{identifier: "HFE-9"}) |> Map.put(:manual, true)])
+
+    start_dashboard(snapshot: snapshot, recipient: self())
+    {:ok, view, _html} = live(build_conn(), "/")
+
+    assert has_element?(view, "#queue-card-default-HFE-9 span.chip.chip--muted", "Manual")
+
+    view |> element("#queue-card-default-HFE-9 button", "Remove") |> render_click()
+    assert_receive {:orchestrator_call, {:remove_manual_issue, "issue-HFE-9"}}
+  end
+
+  test "the add-issue field queues an issue by id and reports what came back" do
+    start_dashboard(recipient: self())
+    {:ok, view, _html} = live(build_conn(), "/")
+
+    assert has_element?(view, "form.queue-add-form input#queue-add-default[placeholder=\"HFE-1234\"]")
+
+    view
+    |> element("form.queue-add-form")
+    |> render_submit(%{"project" => "default", "field" => "queue-add:default", "value" => "  "})
+
+    assert render(view) =~ "Type an issue id"
+
+    view
+    |> element("form.queue-add-form")
+    |> render_submit(%{"project" => "default", "field" => "queue-add:default", "value" => " HFE-9 "})
+
+    assert_receive {:orchestrator_call, {:add_manual_issue, "HFE-9"}}
+    # The static orchestrator answers a bare :ok, which is not an issue.
+    assert eventually(fn -> render(view) =~ "Could not queue HFE-9" end)
+
+    send(view.pid, {:queue_add_result, "queue-add:default", "HFE-9", {:ok, %{identifier: "HFE-9", state: "Todo"}}})
+    assert render(view) =~ "Queued HFE-9 (Todo)."
+
+    for {reason, text} <- [
+          {:issue_not_found, "HFE-9 was not found"},
+          {{:issue_terminal, "Done"}, "HFE-9 is already Done"},
+          {:not_found, "That project is not running"},
+          {{:state_update_failed, :nope}, "Could not move HFE-9"}
+        ] do
+      send(view.pid, {:queue_add_result, "queue-add:default", "HFE-9", {:error, reason}})
+      assert render(view) =~ text
+    end
+  end
+
+  defp eventually(fun, attempts \\ 40) do
+    cond do
+      fun.() -> true
+      attempts == 0 -> false
+      true -> Process.sleep(25) && eventually(fun, attempts - 1)
+    end
+  end
+
   test "retrying rows carry project_name so Retry now can find the orchestrator" do
     start_dashboard()
     {:ok, view, _html} = live(build_conn(), "/")

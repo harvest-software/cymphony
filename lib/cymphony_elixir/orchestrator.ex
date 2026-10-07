@@ -25,11 +25,22 @@ defmodule CymphonyElixir.Orchestrator do
 
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
   alias CymphonyElixir.Linear.Issue
-  alias CymphonyElixir.Orchestrator.{Dispatch, Queue, Stall, Tokens}
+  alias CymphonyElixir.Orchestrator.{Dispatch, DurableState, Queue, Stall, Tokens}
   alias CymphonyElixirWeb.ObservabilityPubSub
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  # A usage-limit window is waited out, not retried: the issue is parked until
+  # the CLI's own reset time plus this grace, so the first attempt after the
+  # reset is not refused by a clock that is a few seconds behind.
+  @usage_limit_grace_ms 60_000
+  # When the CLI says it is limited but not until when (a proxy that prints
+  # only the message, a reset time in a zone we do not parse).
+  @usage_limit_fallback_seconds 30 * 60
+  # A resumed conversation that keeps failing may itself be the problem (a
+  # context that no longer fits, a corrupted transcript). After this many
+  # consecutive failures the next attempt starts fresh.
+  @resume_failure_cap 3
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_token_totals %{
@@ -65,6 +76,16 @@ defmodule CymphonyElixir.Orchestrator do
       recent_completed: [],
       claimed: MapSet.new(),
       retry_attempts: %{},
+      # issue_id => %{session_id, agent_kind, worker_host, identifier, reason}:
+      # the agent conversation the next dispatch of that issue should resume.
+      resumable: %{},
+      # {agent_kind, provider | nil} => unix seconds the usage window resets.
+      usage_limits: %{},
+      # Issue ids added by hand (dashboard / API), polled by id every tick even
+      # when the tracker query (assignee, scope) would not return them.
+      manual_issue_ids: [],
+      # Last durable snapshot written, so a checkpoint with nothing new is free.
+      durable_snapshot: nil,
       token_totals: nil,
       rate_limits: nil
     ]
@@ -102,11 +123,18 @@ defmodule CymphonyElixir.Orchestrator do
       queue_pins: queue_pins,
       queue_priority_seen: queue_priority_seen,
       recent_completed: load_recent_completed(project_name),
+      manual_issue_ids: load_manual_issue_ids(project_name),
       token_totals: @empty_token_totals,
       rate_limits: nil
     }
 
     run_terminal_workspace_cleanup(state)
+
+    state =
+      state
+      |> restore_durable_state(DurableState.load(project_name))
+      |> checkpoint()
+
     state = schedule_tick(state, 0)
     schedule_workspace_sweep(state.config)
 
@@ -153,7 +181,7 @@ defmodule CymphonyElixir.Orchestrator do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
-    state = %{state | poll_check_in_progress: false}
+    state = checkpoint(%{state | poll_check_in_progress: false})
 
     notify_dashboard()
     {:noreply, state}
@@ -177,7 +205,10 @@ defmodule CymphonyElixir.Orchestrator do
             :normal ->
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
+              # A clean finish hands control back on purpose: the continuation
+              # starts a fresh conversation, as it always has.
               state
+              |> forget_resumable(issue_id)
               |> complete_issue(issue_id, running_entry)
               |> schedule_issue_retry(issue_id, 1, %{
                 identifier: running_entry.identifier,
@@ -186,13 +217,18 @@ defmodule CymphonyElixir.Orchestrator do
                 workspace_path: Map.get(running_entry, :workspace_path)
               })
 
+            {:shutdown, {:usage_limit, limit}} ->
+              park_usage_limited(state, issue_id, running_entry, limit)
+
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
               next_attempt = next_retry_attempt_from_running(running_entry)
               failures = running_entry_failure_count(running_entry) + 1
 
-              maybe_retry_or_abandon(state, issue_id, next_attempt, failures, %{
+              state
+              |> remember_resumable_unless_failing(issue_id, running_entry, failures, "the agent exited with an error")
+              |> maybe_retry_or_abandon(issue_id, next_attempt, failures, %{
                 identifier: running_entry.identifier,
                 error: "agent exited: #{format_exit_reason(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
@@ -204,7 +240,7 @@ defmodule CymphonyElixir.Orchestrator do
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
         notify_dashboard()
-        {:noreply, state}
+        {:noreply, checkpoint(state)}
     end
   end
 
@@ -260,10 +296,16 @@ defmodule CymphonyElixir.Orchestrator do
           state
           |> apply_agent_token_delta(token_delta)
           |> apply_rate_limits(update)
+          |> clear_usage_limit_on_success(updated_running_entry, update)
 
         notify_dashboard()
         ObservabilityPubSub.broadcast_issue_update(issue_id)
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
+
+        # The session id is what a restart needs to resume this run, so it is
+        # written down the moment the CLI prints it.
+        state = if update.event == :session_identified, do: checkpoint(state), else: state
+        {:noreply, state}
     end
   end
 
@@ -272,18 +314,18 @@ defmodule CymphonyElixir.Orchestrator do
   def handle_info({:retry_issue, issue_id, retry_token}, %State{paused: true} = state) do
     state = hold_retry_attempt(state, issue_id, retry_token)
     notify_dashboard()
-    {:noreply, state}
+    {:noreply, checkpoint(state)}
   end
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
-    result =
+    {:noreply, state} =
       case pop_retry_attempt_state(state, issue_id, retry_token) do
         {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
         :missing -> {:noreply, state}
       end
 
     notify_dashboard()
-    result
+    {:noreply, checkpoint(state)}
   end
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
@@ -303,8 +345,12 @@ defmodule CymphonyElixir.Orchestrator do
     state = reconcile_running_issues(state)
 
     with :ok <- Config.validate!(state.config),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(state.config) do
-      state = attach_waiting(state, issues)
+         {:ok, issues, state} <- fetch_dispatch_candidates(state) do
+      state =
+        state
+        |> prune_resumable(issues)
+        |> attach_waiting(issues)
+
       if state.paused, do: state, else: dispatch_waiting_list(state)
     else
       {:error, :missing_linear_api_token} ->
@@ -369,6 +415,7 @@ defmodule CymphonyElixir.Orchestrator do
       case Tracker.fetch_issue_states_by_ids(running_ids, state.config) do
         {:ok, issues} ->
           issues
+          |> mark_manual_issues(state)
           |> reconcile_running_issue_states(
             state,
             active_state_set(state),
@@ -510,6 +557,10 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
+    terminate_running_issue(state, issue_id, cleanup_workspace, "Cymphony stopped the run")
+  end
+
+  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace, resume_reason) do
     drop_harness_stream(issue_id)
 
     case Map.get(state.running, issue_id) do
@@ -518,6 +569,14 @@ defmodule CymphonyElixir.Orchestrator do
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
+
+        # A run stopped part-way keeps its conversation for the next dispatch;
+        # one whose ticket is finished (workspace being removed) does not.
+        state =
+          if cleanup_workspace,
+            do: forget_resumable(state, issue_id),
+            else: remember_resumable(state, issue_id, running_entry, resume_reason)
+
         worker_host = Map.get(running_entry, :worker_host)
 
         if cleanup_workspace do
@@ -578,7 +637,8 @@ defmodule CymphonyElixir.Orchestrator do
       failures = running_entry_failure_count(running_entry) + 1
 
       state
-      |> terminate_running_issue(issue_id, false)
+      |> terminate_running_issue(issue_id, false, "it stopped producing output and the stall watchdog restarted it")
+      |> remember_resumable_unless_failing(issue_id, running_entry, failures, "it stopped producing output and the stall watchdog restarted it")
       |> maybe_retry_or_abandon(issue_id, next_attempt, failures, %{
         identifier: identifier,
         error: "stalled for #{elapsed_ms}ms without agent activity",
@@ -684,6 +744,9 @@ defmodule CymphonyElixir.Orchestrator do
         state
 
       not waiting_capacity_available?(issue, state) ->
+        walk_waiting_dispatch(state, rest)
+
+      usage_block_until(state, issue, from_waiting: true) != nil ->
         walk_waiting_dispatch(state, rest)
 
       should_dispatch_issue?(issue, state, active_state_set(state), terminal_state_set(state)) ->
@@ -1060,7 +1123,9 @@ defmodule CymphonyElixir.Orchestrator do
   defp do_transition_to_in_progress(_issue, _queued_states, _in_progress_state, _update_fun), do: :ok
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil, opts \\ []) do
-    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids(&1, state.config), terminal_state_set(state), state) do
+    fetcher = fn ids -> state |> fetch_issues_by_ids(ids) end
+
+    case revalidate_issue_for_dispatch(issue, fetcher, terminal_state_set(state), state) do
       {:ok, %Issue{} = refreshed_issue} ->
         transition_to_in_progress(refreshed_issue, state)
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, opts)
@@ -1097,8 +1162,9 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, opts) do
     spec = dispatch_run_spec(state, issue, opts)
+    opts = Keyword.merge(opts, resume_opts(state, issue, spec, worker_host))
 
-    case start_issue_agent_task(state, issue, attempt, recipient, worker_host, spec) do
+    case start_issue_agent_task(state, issue, attempt, recipient, worker_host, spec, opts) do
       {:ok, pid} ->
         track_spawned_issue(state, issue, attempt, worker_host, spec, pid, opts)
 
@@ -1171,9 +1237,9 @@ defmodule CymphonyElixir.Orchestrator do
       (is_binary(pin_effort) and pin_effort == effort)
   end
 
-  defp start_issue_agent_task(state, issue, attempt, recipient, worker_host, spec) do
-    Task.Supervisor.start_child(CymphonyElixir.TaskSupervisor, fn ->
-      AgentRunner.run(issue, recipient,
+  defp start_issue_agent_task(state, issue, attempt, recipient, worker_host, spec, opts) do
+    runner_opts =
+      [
         attempt: attempt,
         worker_host: worker_host,
         config: state.config,
@@ -1182,14 +1248,17 @@ defmodule CymphonyElixir.Orchestrator do
         agent_kind: spec.agent_kind,
         model: spec.model,
         effort: spec.effort
-      )
+      ] ++ Keyword.take(opts, [:resume_session_id, :resume_reason])
+
+    Task.Supervisor.start_child(CymphonyElixir.TaskSupervisor, fn ->
+      AgentRunner.run(issue, recipient, runner_opts)
     end)
   end
 
   defp track_spawned_issue(state, issue, attempt, worker_host, spec, pid, opts) do
     ref = Process.monitor(pid)
 
-    Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+    Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}#{resume_log_suffix(opts)}")
 
     running =
       Map.put(
@@ -1198,7 +1267,7 @@ defmodule CymphonyElixir.Orchestrator do
         append_log_event(
           initial_running_entry(issue, attempt, worker_host, spec, pid, ref, opts),
           :agent_dispatched,
-          spawned_issue_log_detail(worker_host, spec, attempt)
+          spawned_issue_log_detail(worker_host, spec, attempt, opts)
         )
       )
 
@@ -1223,6 +1292,10 @@ defmodule CymphonyElixir.Orchestrator do
       effort: spec.effort,
       workspace_path: nil,
       session_id: nil,
+      # The CLI's real session id once it prints one (`session_id` above also
+      # holds the display placeholder "new"). This is what a resume needs.
+      resume_session_id: nil,
+      resumed_from: Keyword.get(opts, :resume_session_id),
       last_agent_message: nil,
       last_agent_timestamp: nil,
       last_agent_event: nil,
@@ -1245,6 +1318,13 @@ defmodule CymphonyElixir.Orchestrator do
     source = Map.get(spec, :source) || spec.resolved.source
 
     "worker_host=#{worker_host || "local"} provider=#{spec.provider || "default"} agent=#{spec.agent_kind} model=#{spec.model || "default"} effort=#{spec.effort || "default"} source=#{source} attempt=#{inspect(attempt)}"
+  end
+
+  defp spawned_issue_log_detail(worker_host, spec, attempt, opts) do
+    case Keyword.get(opts, :resume_session_id) do
+      id when is_binary(id) -> spawned_issue_log_detail(worker_host, spec, attempt) <> " resume=#{id}"
+      _ -> spawned_issue_log_detail(worker_host, spec, attempt)
+    end
   end
 
   defp handle_spawn_failure(state, issue, attempt, worker_host, reason, opts) do
@@ -1341,7 +1421,7 @@ defmodule CymphonyElixir.Orchestrator do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
     metadata_with_backoff = Map.put_new(metadata, :max_retry_backoff_ms, state.config.agent.max_retry_backoff_ms)
-    delay_ms = retry_delay(next_attempt, metadata_with_backoff)
+    delay_ms = metadata[:delay_ms] || retry_delay(next_attempt, metadata_with_backoff)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
@@ -1369,11 +1449,15 @@ defmodule CymphonyElixir.Orchestrator do
             timer_ref: timer_ref,
             retry_token: retry_token,
             due_at_ms: due_at_ms,
+            # Wall-clock twin of `due_at_ms`, which is monotonic and therefore
+            # meaningless once the daemon restarts.
+            due_at_wall_ms: System.os_time(:millisecond) + delay_ms,
             identifier: identifier,
             error: error,
             worker_host: worker_host,
             workspace_path: workspace_path,
-            failures: failures
+            failures: failures,
+            usage_limited_until: metadata[:usage_limited_until]
           })
     }
   end
@@ -1412,7 +1496,8 @@ defmodule CymphonyElixir.Orchestrator do
       |> Map.merge(%{
         timer_ref: timer_ref,
         retry_token: retry_token,
-        due_at_ms: System.monotonic_time(:millisecond)
+        due_at_ms: System.monotonic_time(:millisecond),
+        due_at_wall_ms: System.os_time(:millisecond)
       })
       |> Map.delete(:held)
 
@@ -1440,8 +1525,8 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_candidate_issues(state.config) do
-      {:ok, issues} ->
+    case fetch_dispatch_candidates(state) do
+      {:ok, issues, state} ->
         issues
         |> find_issue_by_id(issue_id)
         |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
@@ -1562,6 +1647,36 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(%State{} = state, issue, attempt, metadata) do
+    resets_at = if metadata[:force] == true, do: nil, else: usage_block_until(state, issue, [])
+
+    if is_integer(resets_at) do
+      wait_out_usage_limit(state, issue, attempt, metadata, resets_at)
+    else
+      handle_unblocked_retry(state, issue, attempt, metadata)
+    end
+  end
+
+  # Every provider this issue could run on is still inside its usage window.
+  # Not a failure and not backpressure that should grow the backoff: the retry
+  # simply moves to the reset, keeping its attempt and failure counts.
+  defp wait_out_usage_limit(state, issue, attempt, metadata, resets_at) do
+    Logger.info("Usage limit still in effect for #{issue_context(issue)}; retrying after #{format_unix(resets_at)}")
+
+    {:noreply,
+     schedule_issue_retry(
+       state,
+       issue.id,
+       attempt,
+       Map.merge(metadata, %{
+         identifier: issue.identifier,
+         error: "waiting for the usage limit to reset (#{format_unix(resets_at)})",
+         delay_ms: usage_wait_ms(resets_at),
+         usage_limited_until: resets_at
+       })
+     )}
+  end
+
+  defp handle_unblocked_retry(%State{} = state, issue, attempt, metadata) do
     retry_candidate? =
       retry_candidate_issue?(issue, active_state_set(state), queued_state_set(state), terminal_state_set(state), state)
 
@@ -1629,6 +1744,480 @@ defmodule CymphonyElixir.Orchestrator do
     end
   end
 
+  ## Usage limits
+
+  # The run was refused by its usage window. Waiting it out is the whole
+  # remedy, so this is neither a failure (the issue must never be abandoned
+  # over it) nor ordinary backoff (retrying every five minutes for hours only
+  # burns attempts). The issue is parked until the reset, its conversation is
+  # kept for `--resume`, and the {agent, provider} pair is marked limited so
+  # nothing else is dispatched onto it in the meantime.
+  defp park_usage_limited(%State{} = state, issue_id, running_entry, limit) do
+    now_s = System.os_time(:second)
+    resets_at = usage_reset_time(limit, now_s)
+    key = {Map.get(running_entry, :agent_kind), Map.get(running_entry, :provider)}
+    identifier = Map.get(running_entry, :identifier, issue_id)
+
+    Logger.warning(
+      "Usage limit reached for issue_id=#{issue_id} issue_identifier=#{identifier} agent=#{elem(key, 0)} provider=#{elem(key, 1) || "default"}: #{limit[:message]}; parked until #{format_unix(resets_at)}"
+    )
+
+    %{state | usage_limits: Map.put(state.usage_limits, key, resets_at)}
+    |> remember_resumable(issue_id, running_entry, "the agent hit its usage limit")
+    |> schedule_issue_retry(issue_id, next_retry_attempt_from_running(running_entry), %{
+      identifier: identifier,
+      error: "usage limit reached; resumes after #{format_unix(resets_at)}",
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      failures: running_entry_failure_count(running_entry),
+      delay_ms: usage_wait_ms(resets_at),
+      usage_limited_until: resets_at
+    })
+  end
+
+  defp usage_reset_time(%{resets_at: resets_at}, now_s) when is_integer(resets_at) and resets_at > now_s,
+    do: resets_at
+
+  defp usage_reset_time(_limit, now_s), do: now_s + @usage_limit_fallback_seconds
+
+  defp usage_wait_ms(resets_at) do
+    max(0, resets_at - System.os_time(:second)) * 1_000 + @usage_limit_grace_ms
+  end
+
+  defp format_unix(unix) when is_integer(unix) do
+    unix |> DateTime.from_unix!() |> Calendar.strftime("%Y-%m-%d %H:%M UTC")
+  end
+
+  defp unix_to_datetime(unix) when is_integer(unix), do: DateTime.from_unix!(unix)
+  defp unix_to_datetime(_unix), do: nil
+
+  defp active_usage_limits(%State{usage_limits: limits}) do
+    now_s = System.os_time(:second)
+    Map.filter(limits, fn {_key, resets_at} -> resets_at > now_s end)
+  end
+
+  defp usage_limited?(%State{} = state, kind, provider) do
+    Map.has_key?(active_usage_limits(state), {kind, provider})
+  end
+
+  # The reset time when every provider `issue` could be dispatched onto is
+  # inside its usage window, else nil. Mirrors `dispatch_run_spec/3`: the kind
+  # the issue would run as (pin, override, label/directive, project default)
+  # and the providers that kind would draw from.
+  defp usage_block_until(%State{} = state, %Issue{} = issue, opts) do
+    case active_usage_limits(state) do
+      limits when limits == %{} -> nil
+      limits -> latest_shared_reset(state, issue, opts, limits)
+    end
+  end
+
+  defp latest_shared_reset(state, issue, opts, limits) do
+    kind = run_spec_kind(state, issue, opts)
+    resets = state |> provider_candidates(issue, kind, opts) |> Enum.map(&Map.get(limits, {kind, &1}))
+    if Enum.all?(resets, &is_integer/1), do: Enum.min(resets)
+  end
+
+  defp run_spec_kind(%State{} = state, issue, opts) do
+    resolved = RunSpecResolver.resolve(issue, state_config(state))
+
+    pick_run_spec_field(
+      Keyword.get(opts, :from_waiting, false),
+      pin_field(queue_pin_for(state, issue), :agent_kind),
+      Keyword.get(opts, :agent_kind_override),
+      resolved.agent_kind
+    )
+  end
+
+  defp provider_candidates(%State{} = state, issue, kind, opts) do
+    resolved = RunSpecResolver.resolve(issue, state_config(state))
+    config = state_config(state)
+
+    cond do
+      is_binary(Keyword.get(opts, :provider_override)) -> [Keyword.get(opts, :provider_override)]
+      is_binary(resolved.provider) -> [resolved.provider]
+      config.agent.kind == kind and match?([_ | _], state.providers) -> state.providers
+      config.agent.kind == kind -> [select_provider(state)]
+      true -> [Agent.section(config, kind).provider]
+    end
+  end
+
+  # A completed turn on a limited {agent, provider} proves the window is open
+  # again, whatever the recorded reset time said.
+  defp clear_usage_limit_on_success(%State{} = state, running_entry, %{event: :turn_completed}) do
+    key = {Map.get(running_entry, :agent_kind), Map.get(running_entry, :provider)}
+    %{state | usage_limits: Map.delete(state.usage_limits, key)}
+  end
+
+  defp clear_usage_limit_on_success(state, _running_entry, _update), do: state
+
+  defp snapshot_usage_limits(%State{} = state) do
+    state
+    |> active_usage_limits()
+    |> Enum.map(fn {{kind, provider}, resets_at} ->
+      %{agent_kind: kind, provider: provider, resets_at: unix_to_datetime(resets_at)}
+    end)
+    |> Enum.sort_by(&{&1.agent_kind, &1.provider || ""})
+  end
+
+  ## Resumable sessions
+
+  # Records the conversation `running_entry` was having so the next dispatch
+  # of the issue resumes it. An entry that never learned a real session id
+  # (killed before the CLI printed one) leaves an older record in place: that
+  # older conversation is still the latest one that exists.
+  defp remember_resumable(%State{} = state, issue_id, running_entry, reason) do
+    case Map.get(running_entry, :resume_session_id) do
+      session_id when is_binary(session_id) ->
+        record = %{
+          session_id: session_id,
+          agent_kind: Map.get(running_entry, :agent_kind),
+          worker_host: Map.get(running_entry, :worker_host),
+          identifier: Map.get(running_entry, :identifier),
+          reason: reason
+        }
+
+        %{state | resumable: Map.put(state.resumable, issue_id, record)}
+
+      _ ->
+        state
+    end
+  end
+
+  defp remember_resumable_unless_failing(%State{} = state, issue_id, running_entry, failures, reason) do
+    if failures >= @resume_failure_cap do
+      Logger.info("Not resuming issue_id=#{issue_id} after #{failures} consecutive failures; the next attempt starts a fresh session")
+      forget_resumable(state, issue_id)
+    else
+      remember_resumable(state, issue_id, running_entry, reason)
+    end
+  end
+
+  defp forget_resumable(%State{} = state, issue_id) do
+    %{state | resumable: Map.delete(state.resumable, issue_id)}
+  end
+
+  # Only an issue Cymphony may still dispatch keeps a resumable conversation.
+  # One that went to review, was finished, or was reassigned drops it, so the
+  # map (and the state file) cannot grow without bound.
+  defp prune_resumable(%State{} = state, issues) do
+    live =
+      issues
+      |> Enum.flat_map(fn
+        %Issue{id: id} when is_binary(id) -> [id]
+        _ -> []
+      end)
+      |> Enum.concat(Map.keys(state.running))
+      |> Enum.concat(Map.keys(state.retry_attempts))
+      |> MapSet.new()
+
+    %{state | resumable: Map.filter(state.resumable, fn {issue_id, _record} -> MapSet.member?(live, issue_id) end)}
+  end
+
+  # A session belongs to one CLI and one machine: Claude cannot resume a Codex
+  # thread, and a transcript under one host's `~/.claude` is not on another.
+  defp resume_opts(%State{} = state, %Issue{id: issue_id}, spec, worker_host) do
+    case Map.get(state.resumable, issue_id) do
+      %{session_id: session_id, agent_kind: kind, worker_host: ^worker_host} = record
+      when is_binary(session_id) ->
+        if kind == spec.agent_kind,
+          do: [resume_session_id: session_id, resume_reason: record.reason],
+          else: []
+
+      _ ->
+        []
+    end
+  end
+
+  defp resume_log_suffix(opts) do
+    case Keyword.get(opts, :resume_session_id) do
+      id when is_binary(id) -> " resume_session_id=#{id}"
+      _ -> ""
+    end
+  end
+
+  defp resume_session_for_update(_existing, %{event: event, session_id: session_id})
+       when event in [:session_identified, :turn_completed] and is_binary(session_id) and
+              session_id not in ["", "new"],
+       do: session_id
+
+  defp resume_session_for_update(existing, _update), do: existing
+
+  ## Durable state
+
+  # Writes the restart-relevant state (`DurableState`) when it changed since
+  # the last write. Called after every event that can move it: dispatch,
+  # task exit, retry firing, a session id arriving, operator commands.
+  defp checkpoint(%State{} = state) do
+    snapshot = durable_snapshot(state)
+
+    if snapshot == state.durable_snapshot do
+      state
+    else
+      case DurableState.save(state.project_name, snapshot) do
+        :ok ->
+          %{state | durable_snapshot: snapshot}
+
+        {:error, reason} ->
+          Logger.warning("event=\"orchestrator_state.persist\" status=error reason=#{inspect(reason)}")
+          state
+      end
+    end
+  end
+
+  defp durable_snapshot(%State{} = state) do
+    %{
+      retries:
+        Map.new(state.retry_attempts, fn {issue_id, retry} ->
+          {issue_id,
+           %{
+             identifier: Map.get(retry, :identifier),
+             attempt: Map.get(retry, :attempt),
+             failures: Map.get(retry, :failures, 0),
+             error: Map.get(retry, :error),
+             due_at_ms: Map.get(retry, :due_at_wall_ms) || 0,
+             held: Map.get(retry, :held) == true,
+             worker_host: Map.get(retry, :worker_host),
+             workspace_path: Map.get(retry, :workspace_path),
+             usage_limited_until: Map.get(retry, :usage_limited_until)
+           }}
+        end),
+      running:
+        Map.new(state.running, fn {issue_id, entry} ->
+          {issue_id,
+           %{
+             identifier: Map.get(entry, :identifier),
+             attempt: Map.get(entry, :retry_attempt),
+             failures: running_entry_failure_count(entry),
+             worker_host: Map.get(entry, :worker_host),
+             workspace_path: Map.get(entry, :workspace_path),
+             session_id: Map.get(entry, :resume_session_id),
+             agent_kind: Map.get(entry, :agent_kind)
+           }}
+        end),
+      resumable: state.resumable,
+      usage_limits: active_usage_limits(state)
+    }
+  end
+
+  # Rebuilds what the previous daemon left behind. A run that was still going
+  # when it stopped is not lost: it comes back as a retry due now, resuming its
+  # conversation, with its attempt and failure counts as they were — being
+  # interrupted by a restart is not the run's fault.
+  defp restore_durable_state(%State{} = state, durable) do
+    now_ms = System.os_time(:millisecond)
+
+    {resumable, interrupted} =
+      Enum.reduce(durable.running, {durable.resumable, %{}}, fn {issue_id, run}, {resumable, retries} ->
+        {put_interrupted_resumable(resumable, issue_id, run), Map.put(retries, issue_id, interrupted_retry(run, now_ms))}
+      end)
+
+    now_s = div(now_ms, 1_000)
+    usage_limits = Map.filter(durable.usage_limits, fn {_key, resets_at} -> resets_at > now_s end)
+    state = %{state | resumable: resumable, usage_limits: usage_limits}
+
+    interrupted
+    |> Map.merge(durable.retries)
+    |> Enum.reduce(state, &rearm_restored_retry(&2, &1, now_ms))
+  end
+
+  defp put_interrupted_resumable(resumable, issue_id, %{session_id: session_id, agent_kind: kind} = run)
+       when is_binary(session_id) and is_binary(kind) do
+    Map.put(resumable, issue_id, %{
+      session_id: session_id,
+      agent_kind: kind,
+      worker_host: run.worker_host,
+      identifier: run.identifier,
+      reason: "the Cymphony daemon restarted mid-run"
+    })
+  end
+
+  defp put_interrupted_resumable(resumable, _issue_id, _run), do: resumable
+
+  defp interrupted_retry(run, now_ms) do
+    %{
+      identifier: run.identifier,
+      attempt: run.attempt || 1,
+      failures: run.failures,
+      error: "interrupted by a daemon restart",
+      due_at_ms: now_ms,
+      held: false,
+      worker_host: run.worker_host,
+      workspace_path: run.workspace_path,
+      usage_limited_until: nil
+    }
+  end
+
+  defp rearm_restored_retry(%State{} = state, {issue_id, retry}, now_ms) do
+    delay_ms = max(0, retry.due_at_ms - now_ms)
+    held? = retry.held and state.paused
+    retry_token = make_ref()
+
+    timer_ref =
+      if held?, do: nil, else: Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
+
+    Logger.info("Restored retry for issue_id=#{issue_id} issue_identifier=#{retry.identifier || issue_id} (attempt #{retry.attempt}) #{if held?, do: "held", else: "due in #{delay_ms}ms"}")
+
+    entry =
+      %{
+        attempt: retry.attempt,
+        timer_ref: timer_ref,
+        retry_token: retry_token,
+        due_at_ms: System.monotonic_time(:millisecond) + delay_ms,
+        due_at_wall_ms: now_ms + delay_ms,
+        identifier: retry.identifier,
+        error: retry.error,
+        worker_host: retry.worker_host,
+        workspace_path: retry.workspace_path,
+        failures: retry.failures,
+        usage_limited_until: retry.usage_limited_until
+      }
+      |> then(&if held?, do: Map.put(&1, :held, true), else: &1)
+
+    %{
+      state
+      | retry_attempts: Map.put(state.retry_attempts, issue_id, entry),
+        claimed: MapSet.put(state.claimed, issue_id)
+    }
+  end
+
+  ## Manual issues
+
+  # The tracker query plus every issue added by hand. A manual issue is
+  # fetched by id, so neither the assignee filter nor `scope_issue` hides it,
+  # and it is marked routable so the dispatch filters do not drop it either.
+  # One that is finished or no longer exists is dropped from the list.
+  defp fetch_dispatch_candidates(%State{} = state) do
+    with {:ok, issues} <- Tracker.fetch_candidate_issues(state.config) do
+      present = MapSet.new(Enum.flat_map(issues, &issue_keys/1))
+      missing = Enum.reject(state.manual_issue_ids, &MapSet.member?(present, &1))
+
+      case fetch_manual_issues(state, missing) do
+        {:ok, fetched} ->
+          {:ok, mark_manual_issues(issues ++ fetched, state), prune_manual_issue_ids(state, missing, issues ++ fetched)}
+
+        {:error, reason} ->
+          Logger.warning("Could not refresh manually added issues #{Enum.join(missing, ",")}: #{inspect(reason)}")
+          {:ok, mark_manual_issues(issues, state), state}
+      end
+    end
+  end
+
+  defp fetch_manual_issues(_state, []), do: {:ok, []}
+  defp fetch_manual_issues(state, ids), do: Tracker.fetch_issue_states_by_ids(ids, state.config)
+
+  # `seen` is every issue this poll returned. Finished: seen in a terminal
+  # state. Gone: fetched by id (`requested`) and not returned at all.
+  defp prune_manual_issue_ids(%State{} = state, requested, seen) do
+    terminal_states = terminal_state_set(state)
+    fetched_keys = MapSet.new(Enum.flat_map(seen, &issue_keys/1))
+
+    finished =
+      seen
+      |> Enum.filter(&(match?(%Issue{}, &1) and terminal_issue_state?(&1.state, terminal_states)))
+      |> Enum.flat_map(&issue_keys/1)
+      |> MapSet.new()
+
+    gone = Enum.reject(requested, &MapSet.member?(fetched_keys, &1))
+    drop = MapSet.union(finished, MapSet.new(gone))
+    remaining = Enum.reject(state.manual_issue_ids, &MapSet.member?(drop, &1))
+
+    if remaining == state.manual_issue_ids do
+      state
+    else
+      Logger.info("Dropping manually added issues that are finished or gone: #{state.manual_issue_ids |> Enum.filter(&MapSet.member?(drop, &1)) |> Enum.join(",")}")
+      persist_manual_issue_ids(%{state | manual_issue_ids: remaining})
+    end
+  end
+
+  defp fetch_issues_by_ids(%State{} = state, ids) do
+    case Tracker.fetch_issue_states_by_ids(ids, state.config) do
+      {:ok, issues} -> {:ok, mark_manual_issues(issues, state)}
+      other -> other
+    end
+  end
+
+  defp mark_manual_issues(issues, %State{manual_issue_ids: []}), do: issues
+
+  defp mark_manual_issues(issues, %State{} = state) do
+    Enum.map(issues, fn
+      %Issue{} = issue -> if manual_issue?(state, issue), do: %{issue | assigned_to_worker: true}, else: issue
+      other -> other
+    end)
+  end
+
+  defp manual_issue?(%State{manual_issue_ids: ids}, %Issue{} = issue) do
+    Enum.any?(issue_keys(issue), &(&1 in ids))
+  end
+
+  defp issue_keys(%Issue{id: id, identifier: identifier}), do: Enum.filter([id, identifier], &is_binary/1)
+  defp issue_keys(_issue), do: []
+
+  # Adding by hand is an explicit "work on this": an issue sitting in a state
+  # Cymphony does not dispatch from (a backlog, say) is moved to the first
+  # queued state, which is where the tracker's own workflow would put it. A
+  # finished issue is refused rather than reopened.
+  defp add_manual_issue_to_state(%State{} = _state, ""), do: {:error, :invalid_issue}
+
+  defp add_manual_issue_to_state(%State{} = state, issue_key) do
+    config = state_config(state)
+
+    with {:ok, [%Issue{} = issue | _]} <- Tracker.fetch_issue_states_by_ids([issue_key], config),
+         :ok <- reject_terminal(issue, state),
+         {:ok, issue} <- ensure_dispatchable_state(issue, state) do
+      key = issue.id || issue_key
+      ids = if key in state.manual_issue_ids, do: state.manual_issue_ids, else: state.manual_issue_ids ++ [key]
+      Logger.info("Manually queued #{issue_context(issue)} state=#{issue.state}")
+      {:ok, issue, persist_manual_issue_ids(%{state | manual_issue_ids: ids})}
+    else
+      {:ok, _none} -> {:error, :issue_not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp reject_terminal(%Issue{state: issue_state}, state) do
+    if terminal_issue_state?(issue_state, terminal_state_set(state)),
+      do: {:error, {:issue_terminal, issue_state}},
+      else: :ok
+  end
+
+  defp ensure_dispatchable_state(%Issue{} = issue, state) do
+    if active_issue_state?(issue.state || "", active_state_set(state)) do
+      {:ok, issue}
+    else
+      move_to_queued_state(issue, state)
+    end
+  end
+
+  defp move_to_queued_state(%Issue{} = issue, state) do
+    config = state_config(state)
+
+    case config.tracker.queued_states do
+      [queued | _] when is_binary(queued) ->
+        case Tracker.update_issue_state(issue.id, queued, config) do
+          :ok -> {:ok, %{issue | state: queued}}
+          {:error, reason} -> {:error, {:state_update_failed, reason}}
+        end
+
+      _ ->
+        {:error, {:issue_not_active, issue.state}}
+    end
+  end
+
+  defp persist_manual_issue_ids(%State{} = state) do
+    persist_project_queue(state.project_name, %{"manual_issues" => state.manual_issue_ids})
+    state
+  end
+
+  defp load_manual_issue_ids(project_name) do
+    with {:ok, config} <- CymphonyConfig.load(),
+         {:ok, project} <- project_for_queue(config, project_name),
+         ids when is_list(ids) <- Map.get(project, "manual_issues") do
+      ids |> Enum.filter(&(is_binary(&1) and &1 != "")) |> Enum.uniq()
+    else
+      _ -> []
+    end
+  end
+
   defp max_retry_attempts(%State{} = state), do: state_config(state).agent.max_retry_attempts
 
   # Reschedule a failed issue, or abandon it once it has failed
@@ -1667,7 +2256,8 @@ defmodule CymphonyElixir.Orchestrator do
     %{
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        resumable: Map.delete(state.resumable, issue_id)
     }
   end
 
@@ -1826,8 +2416,17 @@ defmodule CymphonyElixir.Orchestrator do
     end
   end
 
-  defp select_provider(%State{providers: [_ | _] = providers}) do
-    Enum.random(providers)
+  # Rotation skips a provider that is waiting out its usage window. With every
+  # one limited the gate (`usage_block_until/3`) has already declined to
+  # dispatch, so the fallback to the whole list only matters for an operator
+  # override such as Retry now.
+  defp select_provider(%State{providers: [_ | _] = providers} = state) do
+    kind = state_config(state).agent.kind
+
+    case Enum.reject(providers, &usage_limited?(state, kind, &1)) do
+      [] -> Enum.random(providers)
+      available -> Enum.random(available)
+    end
   end
 
   defp select_provider(%State{config: config}) when is_map(config) do
@@ -1933,6 +2532,26 @@ defmodule CymphonyElixir.Orchestrator do
 
   def set_queue_run_spec(_server, _issue_key, _pin), do: {:error, :invalid_queue_pin}
 
+  @doc """
+  Queue an issue by hand (`HFE-1234`). It is polled by id from then on, so the
+  tracker query's assignee and `scope_issue` filters do not hide it; one in a
+  state Cymphony does not dispatch from is moved to the first queued state.
+  """
+  @spec add_manual_issue(GenServer.server(), String.t()) ::
+          {:ok, Issue.t()} | {:error, term()} | :unavailable
+  def add_manual_issue(server, issue_key) when is_binary(issue_key) do
+    GenServer.call(server, {:add_manual_issue, issue_key}, 30_000)
+  catch
+    :exit, _ -> :unavailable
+  end
+
+  @spec remove_manual_issue(GenServer.server(), String.t()) :: :ok | {:error, :not_manual} | :unavailable
+  def remove_manual_issue(server, issue_key) when is_binary(issue_key) do
+    GenServer.call(server, {:remove_manual_issue, issue_key})
+  catch
+    :exit, _ -> :unavailable
+  end
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -1965,6 +2584,7 @@ defmodule CymphonyElixir.Orchestrator do
           effort: Map.get(metadata, :effort),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: Map.get(metadata, :session_id),
+          resumed_from: Map.get(metadata, :resumed_from),
           agent_os_pid: Map.get(metadata, :agent_os_pid),
           input_tokens: Map.get(metadata, :input_tokens, 0),
           output_tokens: Map.get(metadata, :output_tokens, 0),
@@ -1995,7 +2615,9 @@ defmodule CymphonyElixir.Orchestrator do
           identifier: Map.get(retry, :identifier),
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
-          workspace_path: Map.get(retry, :workspace_path)
+          workspace_path: Map.get(retry, :workspace_path),
+          usage_limited_until: unix_to_datetime(Map.get(retry, :usage_limited_until)),
+          resumable: Map.has_key?(state.resumable, issue_id)
         }
       end)
 
@@ -2011,6 +2633,8 @@ defmodule CymphonyElixir.Orchestrator do
        token_totals: state.token_totals,
        rate_limits: Map.get(state, :rate_limits),
        providers: state.providers || [],
+       usage_limits: snapshot_usage_limits(state),
+       manual_issues: state.manual_issue_ids,
        agent_kind: state.config.agent.kind,
        agent_model: state.config.agent.model,
        agent_effort: state.config.agent.effort,
@@ -2034,7 +2658,31 @@ defmodule CymphonyElixir.Orchestrator do
   def handle_call(:resume, _from, state) do
     state = release_held_retries(%{state | paused: false})
     notify_dashboard()
-    {:reply, :ok, state}
+    {:reply, :ok, checkpoint(state)}
+  end
+
+  def handle_call({:add_manual_issue, issue_key}, _from, state) when is_binary(issue_key) do
+    case add_manual_issue_to_state(state, String.trim(issue_key)) do
+      {:ok, issue, state} ->
+        notify_dashboard()
+        {:reply, {:ok, issue}, schedule_tick(state, 0)}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:remove_manual_issue, issue_key}, _from, state) when is_binary(issue_key) do
+    key = String.trim(issue_key)
+    remaining = Enum.reject(state.manual_issue_ids, &(&1 == key))
+
+    if remaining == state.manual_issue_ids do
+      {:reply, {:error, :not_manual}, state}
+    else
+      state = persist_manual_issue_ids(%{state | manual_issue_ids: remaining})
+      notify_dashboard()
+      {:reply, :ok, state}
+    end
   end
 
   def handle_call(:request_refresh, _from, state) do
@@ -2054,9 +2702,9 @@ defmodule CymphonyElixir.Orchestrator do
 
   def handle_call({:kill_issue, issue_id}, _from, state) do
     if Map.has_key?(state.running, issue_id) do
-      state = terminate_running_issue(state, issue_id, false)
+      state = terminate_running_issue(state, issue_id, false, "an operator stopped it from the dashboard")
       notify_dashboard()
-      {:reply, :ok, state}
+      {:reply, :ok, checkpoint(state)}
     else
       {:reply, {:error, :not_running}, state}
     end
@@ -2081,12 +2729,16 @@ defmodule CymphonyElixir.Orchestrator do
           Process.cancel_timer(timer_ref)
         end
 
+        # `force`: the operator asked for this run now, so a usage limit the
+        # orchestrator is waiting out does not hold it back. If the window has
+        # not actually reset the run is refused at once and parked again.
         metadata = %{
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path),
-          failures: Map.get(retry_entry, :failures, 0)
+          failures: Map.get(retry_entry, :failures, 0),
+          force: true
         }
 
         state = %{
@@ -2097,7 +2749,7 @@ defmodule CymphonyElixir.Orchestrator do
 
         {:noreply, new_state} = handle_retry_issue(state, issue_id, attempt, metadata)
         notify_dashboard()
-        {:reply, :ok, new_state}
+        {:reply, :ok, checkpoint(new_state)}
     end
   end
 
@@ -2173,7 +2825,7 @@ defmodule CymphonyElixir.Orchestrator do
         issue = running_entry.issue
         worker_host = Map.get(running_entry, :worker_host)
 
-        state = terminate_running_issue(state, issue_id, false)
+        state = terminate_running_issue(state, issue_id, false, "an operator restarted it with a different run spec")
 
         Logger.info("Run-spec override for #{issue_context(issue)}: #{inspect(Map.take(overrides, [:provider, :model, :effort, :agent_kind]))}")
 
@@ -2186,7 +2838,7 @@ defmodule CymphonyElixir.Orchestrator do
 
         new_state = do_dispatch_issue(state, issue, nil, worker_host, dispatch_opts)
         notify_dashboard()
-        {:reply, :ok, new_state}
+        {:reply, :ok, checkpoint(new_state)}
     end
   end
 
@@ -2241,6 +2893,7 @@ defmodule CymphonyElixir.Orchestrator do
         last_agent_timestamp: timestamp,
         last_agent_message: summarize_agent_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
+        resume_session_id: resume_session_for_update(Map.get(running_entry, :resume_session_id), update),
         last_agent_event: event,
         agent_os_pid: agent_os_pid_for_update(agent_os_pid, update),
         input_tokens: input_tokens + token_delta.input_tokens,
@@ -2648,6 +3301,7 @@ defmodule CymphonyElixir.Orchestrator do
             priority: issue.priority,
             state: issue.state,
             created_at: issue.created_at,
+            manual: manual_issue?(state, issue),
             agent_kind: pin_field(pin, :agent_kind),
             model: pin_field(pin, :model),
             effort: pin_field(pin, :effort)

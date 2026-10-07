@@ -315,6 +315,7 @@ defmodule CymphonyElixirWeb.Presenter do
       effort: Map.get(entry, :effort),
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
+      resumed_from: Map.get(entry, :resumed_from),
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_agent_event,
       last_message: summarize_message(entry.last_agent_message),
@@ -348,6 +349,8 @@ defmodule CymphonyElixirWeb.Presenter do
       held: held?(entry),
       due_at: due_at_iso8601(entry),
       error: entry.error,
+      usage_limited_until: iso8601(Map.get(entry, :usage_limited_until)),
+      resumable: Map.get(entry, :resumable) == true,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       tokens: %{input_tokens: 0, output_tokens: 0, total_tokens: 0},
@@ -376,7 +379,8 @@ defmodule CymphonyElixirWeb.Presenter do
       created_at: waiting_created_at(first_present([issue_field(entry, :created_at), Map.get(entry, :created_at)])),
       agent_kind: Map.get(entry, :agent_kind),
       model: Map.get(entry, :model),
-      effort: Map.get(entry, :effort)
+      effort: Map.get(entry, :effort),
+      manual: Map.get(entry, :manual) == true
     }
   end
 
@@ -420,8 +424,14 @@ defmodule CymphonyElixirWeb.Presenter do
       agent_model: Map.get(snapshot, :agent_model),
       agent_effort: Map.get(snapshot, :agent_effort),
       paused: Map.get(polling, :paused, false),
-      max_concurrent_agents: Map.get(polling, :max_concurrent_agents)
+      max_concurrent_agents: Map.get(polling, :max_concurrent_agents),
+      usage_limits: Enum.map(Map.get(snapshot, :usage_limits, []), &usage_limit_payload/1),
+      manual_issues: Map.get(snapshot, :manual_issues, [])
     }
+  end
+
+  defp usage_limit_payload(limit) do
+    %{agent_kind: limit.agent_kind, provider: limit.provider, resets_at: iso8601(limit.resets_at)}
   end
 
   defp issue_field(entry, key) do
@@ -457,6 +467,7 @@ defmodule CymphonyElixirWeb.Presenter do
       held: held?(retry),
       due_at: due_at_iso8601(retry),
       error: retry.error,
+      usage_limited_until: iso8601(Map.get(retry, :usage_limited_until)),
       worker_host: Map.get(retry, :worker_host),
       workspace_path: Map.get(retry, :workspace_path)
     }

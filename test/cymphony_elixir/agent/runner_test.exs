@@ -1122,4 +1122,88 @@ defmodule CymphonyElixir.Agent.RunnerTest do
       File.rm_rf(test_root)
     end
   end
+
+  describe "live stream signals" do
+    setup do
+      test_root = Path.join(System.tmp_dir!(), "cymphony-runner-signals-#{System.unique_integer([:positive])}")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-7000")
+      File.mkdir_p!(workspace)
+      on_exit(fn -> File.rm_rf(test_root) end)
+
+      issue = %Issue{
+        id: "issue-signals",
+        identifier: "MT-7000",
+        title: "Signals",
+        description: "",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-7000",
+        labels: []
+      }
+
+      %{test_root: test_root, workspace_root: workspace_root, workspace: workspace, issue: issue}
+    end
+
+    defp fake_cli!(ctx, body) do
+      binary = Path.join(ctx.test_root, "fake-claude")
+      File.write!(binary, "#!/bin/sh\n" <> body)
+      File.chmod!(binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: ctx.workspace_root, claude_command: binary)
+    end
+
+    defp collect_messages do
+      {:ok, collector} = Agent.start_link(fn -> [] end)
+      {collector, fn message -> Agent.update(collector, &(&1 ++ [message])) end}
+    end
+
+    test "a usage-limit rejection turns the nonzero exit into {:usage_limit, …}", ctx do
+      fake_cli!(ctx, """
+      echo '{"type":"system","subtype":"init","session_id":"sess-limit"}'
+      echo '{"type":"assistant","session_id":"sess-limit"}'
+      echo '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1791333000,"rateLimitType":"five_hour"},"session_id":"sess-limit"}'
+      echo '{"type":"result","is_error":true,"session_id":"sess-limit"}'
+      exit 1
+      """)
+
+      {collector, on_message} = collect_messages()
+
+      assert {:error, {:usage_limit, %{resets_at: 1_791_333_000, limit_type: "five_hour", tail: tail}}} =
+               Runner.run(ctx.workspace, "do it", ctx.issue, on_message: on_message)
+
+      assert tail =~ "is_error"
+
+      messages = Agent.get(collector, & &1)
+      # Announced once, as soon as the CLI printed it, not once per line.
+      assert [%{session_id: "sess-limit"}] = Enum.filter(messages, &(&1.event == :session_identified))
+      assert [%{payload: %{limit_type: "five_hour"}}] = Enum.filter(messages, &(&1.event == :usage_limit))
+    end
+
+    test "a crash that was not a usage limit stays an agent_exit, with the session id still announced", ctx do
+      fake_cli!(ctx, """
+      echo '{"type":"system","subtype":"init","session_id":"sess-crash"}'
+      echo 'API Error: 500'
+      exit 1
+      """)
+
+      {collector, on_message} = collect_messages()
+
+      assert {:error, {:agent_exit, 1, _tail}} = Runner.run(ctx.workspace, "do it", ctx.issue, on_message: on_message)
+      assert [%{session_id: "sess-crash"}] = collector |> Agent.get(& &1) |> Enum.filter(&(&1.event == :session_identified))
+    end
+
+    test "a changed session id is announced again", ctx do
+      fake_cli!(ctx, """
+      echo '{"type":"system","session_id":"first"}'
+      echo '{"type":"system","session_id":"second"}'
+      echo '{"result":"done","session_id":"second"}'
+      """)
+
+      {collector, on_message} = collect_messages()
+
+      assert {:ok, _} = Runner.run(ctx.workspace, "do it", ctx.issue, on_message: on_message)
+
+      assert ["first", "second"] =
+               collector |> Agent.get(& &1) |> Enum.filter(&(&1.event == :session_identified)) |> Enum.map(& &1.session_id)
+    end
+  end
 end

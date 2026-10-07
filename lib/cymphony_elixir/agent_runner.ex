@@ -11,6 +11,7 @@ defmodule CymphonyElixir.AgentRunner do
   @type worker_host :: String.t() | nil
 
   @harness_heartbeat_interval_ms 2_000
+  @session_seen_key {__MODULE__, :session_identified}
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, agent_update_recipient \\ nil, opts \\ []) do
@@ -24,6 +25,14 @@ defmodule CymphonyElixir.AgentRunner do
     case run_on_worker_host(issue, agent_update_recipient, opts, worker_host) do
       :ok ->
         :ok
+
+      {:error, {:usage_limit, limit}} ->
+        Logger.warning("Agent hit its usage limit for #{issue_context(issue)}: #{limit[:message]} resets_at=#{inspect(limit[:resets_at])}")
+
+        # A `{:shutdown, _}` exit is not logged as a crash, and the orchestrator
+        # matches on it to park the issue until the window resets rather than
+        # counting a failure.
+        exit({:shutdown, {:usage_limit, Map.delete(limit, :tail)}})
 
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
@@ -65,6 +74,8 @@ defmodule CymphonyElixir.AgentRunner do
 
   defp send_agent_update(recipient, %Issue{id: issue_id}, message)
        when is_binary(issue_id) and is_pid(recipient) do
+    note_session_identified(message)
+
     if is_map(message) and message[:event] == :harness_stdout do
       # EP-STREAM: live CLI stdout is ring-buffered; do not forward :harness_stdout to the orchestrator.
       HarnessStream.append(issue_id, to_string(message[:raw] || ""))
@@ -76,7 +87,15 @@ defmodule CymphonyElixir.AgentRunner do
     :ok
   end
 
-  defp send_agent_update(_recipient, _issue, _message), do: :ok
+  defp send_agent_update(_recipient, _issue, message) do
+    note_session_identified(message)
+    :ok
+  end
+
+  # Whether the CLI printed a session id during the current turn. A resumed
+  # turn that fails without one never got as far as loading the conversation.
+  defp note_session_identified(%{event: :session_identified}), do: Process.put(@session_seen_key, true)
+  defp note_session_identified(_message), do: :ok
 
   defp maybe_send_harness_heartbeat(recipient, issue_id, message) do
     now_ms = System.monotonic_time(:millisecond)
@@ -125,6 +144,8 @@ defmodule CymphonyElixir.AgentRunner do
         Keyword.take(opts, [:agent_kind, :model, :effort, :provider_override])
 
     with {:ok, session} <- Runner.start_session(workspace, session_opts) do
+      session = %{session | session_id: resume_session_id(opts)}
+
       try do
         ctx = %{
           workspace: workspace,
@@ -145,23 +166,16 @@ defmodule CymphonyElixir.AgentRunner do
   defp do_run_agent_turns(agent_session, issue, turn_number, ctx) do
     %{
       workspace: workspace,
-      recipient: agent_update_recipient,
       opts: opts,
       issue_state_fetcher: issue_state_fetcher,
       max_turns: max_turns,
       config: config
     } = ctx
 
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns, config)
+    prompt = build_turn_prompt(issue, opts, turn_number, max_turns, config, agent_session.session_id)
 
     with {:ok, turn_result} <-
-           Runner.run_turn(
-             agent_session,
-             prompt,
-             issue,
-             on_message: agent_message_handler(agent_update_recipient, issue),
-             config: config
-           ) do
+           run_turn_or_start_fresh(agent_session, prompt, issue, turn_number, ctx) do
       session_id = turn_result[:session_id]
 
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{session_id} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
@@ -187,6 +201,70 @@ defmodule CymphonyElixir.AgentRunner do
       end
     end
   end
+
+  defp run_turn_or_start_fresh(agent_session, prompt, issue, turn_number, ctx) do
+    %{recipient: recipient, opts: opts, config: config} = ctx
+    Process.delete(@session_seen_key)
+
+    result =
+      Runner.run_turn(agent_session, prompt, issue,
+        on_message: agent_message_handler(recipient, issue),
+        config: config
+      )
+
+    if resume_never_started?(result, turn_number, agent_session.session_id) do
+      # The CLI failed before it printed a session id, so the saved
+      # conversation was never loaded: it was deleted, belongs to another
+      # account, or the resume flag was refused. Losing the context is better
+      # than failing the attempt over it, so run the turn as a fresh session.
+      Logger.warning("Could not resume session #{agent_session.session_id} for #{issue_context(issue)}: #{inspect(elem(result, 1))}; starting a fresh session")
+
+      fresh_opts = Keyword.delete(opts, :resume_session_id)
+
+      Runner.run_turn(
+        %{agent_session | session_id: nil},
+        build_turn_prompt(issue, fresh_opts, 1, ctx.max_turns, config, nil),
+        issue,
+        on_message: agent_message_handler(recipient, issue),
+        config: config
+      )
+    else
+      result
+    end
+  end
+
+  defp resume_never_started?({:error, {:usage_limit, _limit}}, _turn_number, _session_id), do: false
+
+  defp resume_never_started?({:error, _reason}, 1, session_id) when is_binary(session_id),
+    do: Process.get(@session_seen_key) != true
+
+  defp resume_never_started?(_result, _turn_number, _session_id), do: false
+
+  defp resume_session_id(opts) do
+    case Keyword.get(opts, :resume_session_id) do
+      id when is_binary(id) and id != "" -> id
+      _ -> nil
+    end
+  end
+
+  # First turn of a resumed attempt: the conversation already holds the task
+  # and everything the agent did before it was interrupted, so restating the
+  # whole prompt would only cost tokens and invite a restart from scratch.
+  defp build_turn_prompt(_issue, opts, 1, _max_turns, _config, session_id) when is_binary(session_id) do
+    reason = Keyword.get(opts, :resume_reason) || "it was interrupted"
+
+    """
+    Resuming after an interruption:
+
+    - Your previous session on this issue stopped before it finished (#{reason}). This conversation is that session, resumed.
+    - The workspace is the same one you were working in, but time has passed: re-check its state (git status, the workpad, the ticket) before relying on what you remember.
+    - Do not restart the task from scratch. Continue the remaining work from where it actually stands.
+    - If you were waiting on a command or a background task when you stopped, it is gone; re-run it if you still need its result.
+    """
+  end
+
+  defp build_turn_prompt(issue, opts, turn_number, max_turns, config, _session_id),
+    do: build_turn_prompt(issue, opts, turn_number, max_turns, config)
 
   defp build_turn_prompt(issue, opts, 1, _max_turns, config) do
     opts =

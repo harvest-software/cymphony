@@ -28,5 +28,10 @@ if config_env() == :test do
 
   config :cymphony_elixir,
     log_file: Path.join([test_log_root, "log", "cymphony.log"]),
-    daemon_log_file: Path.join(test_log_root, "daemon.log")
+    daemon_log_file: Path.join(test_log_root, "daemon.log"),
+    # Every test orchestrator would otherwise share one state file (the
+    # operator's real one, absent an override) and restore each other's
+    # retries. `DurableStateTest` and the restart tests turn it back on
+    # against a temporary path.
+    durable_orchestrator_state: false
 end

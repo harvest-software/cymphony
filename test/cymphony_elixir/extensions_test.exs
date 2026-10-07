@@ -448,6 +448,7 @@ defmodule CymphonyElixir.ExtensionsTest do
                  "effort" => nil,
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
+                 "resumed_from" => nil,
                  "turn_count" => 7,
                  "last_event" => "notification",
                  "last_message" => "rendered",
@@ -472,6 +473,8 @@ defmodule CymphonyElixir.ExtensionsTest do
                  "held" => false,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
                  "error" => "boom",
+                 "usage_limited_until" => nil,
+                 "resumable" => false,
                  "worker_host" => nil,
                  "workspace_path" => nil,
                  "tokens" => %{"input_tokens" => 0, "output_tokens" => 0, "total_tokens" => 0},
@@ -509,6 +512,8 @@ defmodule CymphonyElixir.ExtensionsTest do
     assert project["waiting"] == []
     assert project["paused"] == false
     assert project["providers"] == []
+    assert project["usage_limits"] == []
+    assert project["manual_issues"] == []
     assert is_list(project["running"])
     assert is_list(project["retrying"])
 

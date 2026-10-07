@@ -1212,7 +1212,9 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - The orchestrator serializes state mutations through one authority to avoid duplicate dispatch.
 - `claimed` and `running` checks are required before launching any worker.
 - Reconciliation runs before dispatch on every tick.
-- Restart recovery is tracker-driven and filesystem-driven (no durable orchestrator DB required).
+- Restart recovery is tracker-driven and filesystem-driven, plus one small state file
+  (`~/.cymphony/orchestrator_state.json`, Section 8.7) that carries the retry queue, held retries,
+  resumable agent sessions and usage limits across a daemon restart.
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 
 ## 8. Polling, Scheduling, and Reconciliation
@@ -1573,12 +1575,46 @@ Paused retries (hold semantics):
 - The explicit "retry now" operator action is an override and still dispatches while paused; hold
   semantics apply to the timer-driven backoff loop only.
 
+Usage limits (parked retries):
+
+- A run whose CLI was refused by its usage window exits with `{:shutdown, {:usage_limit, info}}`
+  (detected live from stdout: Claude's `rate_limit_event` with `status: "rejected"` and its
+  `resetsAt`, else the "You've hit your … limit · resets 1am (UTC)" text).
+- It is **parked**, not failed: `failures` is unchanged (it can never be abandoned over a limit),
+  the retry is due at `resets_at + 60s` (30 minutes when no reset time is known), and the entry
+  carries `usage_limited_until`.
+- The `{agent_kind, provider}` pair is recorded as limited until `resets_at`. Rotation skips a
+  limited provider; when every provider an issue could use is limited, a waiting issue stays
+  queued and a firing retry moves to the reset with its `attempt` and `failures` unchanged.
+- A completed turn on that pair clears the limit early. "Retry now" bypasses the gate.
+
+Resumable sessions:
+
+- The runner reports the CLI's session id as soon as it is printed (`:session_identified`),
+  not only after a clean exit.
+- A run that is killed, crashes, stalls, is restarted with a new run spec, or hits a usage limit
+  leaves `resumable[issue_id] = {session_id, agent_kind, worker_host, reason}`. A clean finish,
+  a terminal ticket, abandonment, or a third consecutive failure clears it, and it is pruned once
+  the issue is no longer a candidate.
+- The next dispatch of the issue with the same agent kind and worker host resumes it
+  (`--resume` / `exec resume` / `--conversation`) with a short "resuming after an interruption"
+  prompt in place of the task prompt. If the resumed CLI fails before printing a session id, the
+  turn is re-run as a fresh session.
+
 Note:
 
 - Terminal-state workspace cleanup is handled by startup cleanup and active-run reconciliation
   (including terminal transitions for currently running issues).
 - Retry handling mainly operates on active candidates and releases claims when the issue is absent,
   rather than performing terminal cleanup itself.
+
+Manual issues:
+
+- `projects[].manual_issues` lists issue ids queued by hand (dashboard / `POST /api/v1/queue-add`).
+  Each poll fetches any not returned by the candidate query by id and marks them routable, so the
+  assignee and scope filters do not hide them; state, blocker and container rules still apply.
+- Adding refuses a terminal issue and moves one outside the active states to the first queued
+  state. A manual issue that becomes terminal or disappears is dropped from the list.
 
 ### 8.5 Active Run Reconciliation
 
@@ -1613,6 +1649,20 @@ When the service starts:
 3. If the terminal-issues fetch fails, log a warning and continue startup.
 
 This prevents stale terminal workspaces from accumulating after restarts.
+
+### 8.7 Durable Orchestrator State
+
+`~/.cymphony/orchestrator_state.json` (mode `0600`, keyed by project name) is rewritten whenever
+the restart-relevant state changes: retry entries (with a wall-clock `due_at_ms`), held flags,
+running sessions (their session ids), resumable sessions, and live usage limits. At startup:
+
+- retries are re-armed at their remaining delay; a held entry stays held only if the project is
+  still paused;
+- a run that was still going is restored as a retry due now, with its attempt and failure count
+  unchanged and its session resumable;
+- expired usage limits are dropped.
+
+An unreadable file logs a warning and starts empty; it never prevents startup.
 
 ## 9. Workspace Management and Safety
 

@@ -99,6 +99,7 @@ hardcoded `~`:
 | `~/.cymphony/daemon.out` | `nohup` redirect | Raw daemon stdout/stderr — status TUI repaints plus any pre-Logger crash |
 | `~/.cymphony/cymphony.pid` | `--daemon-internal` | Daemon OS pid |
 | `~/.cymphony/repos/<project>.git` | `DependencyGate` | Bare mirror for merge checks — never inside a workspace |
+| `~/.cymphony/orchestrator_state.json` | `Orchestrator.DurableState` | Retries, held retries, resumable sessions, usage limits — restored at boot |
 
 Both file handlers buffer and `System.halt/1` does not unwind the VM, so every exit path goes
 through `CLI.halt/1`, which calls `Logger.flush()` first; without it a startup failure leaves both
@@ -449,6 +450,52 @@ CLI → CymphonyConfig → WorkflowStore → Orchestrator (GenServer, per-projec
 - The dashboard's per-row **Retry** button (`retry_issue` → `{:retry_issue_now, id}`) is an
   explicit operator override and still dispatches while paused; the gate covers the timer-driven
   backoff loop only.
+
+### Usage limits, resumable sessions, restart durability
+
+Two jobs were lost to a five-hour usage window: Claude exited 1, the orchestrator treated it as a
+crash, every retry started a **fresh** conversation, and the in-memory retry queue vanished on the
+next daemon restart. Three pieces fix that:
+
+- **Live stream signals.** `Agent.StreamSignals` reads every stdout line as it arrives
+  (`Agent.Runner.emit_line/2`): the CLI's session id (Claude `session_id`, Codex `thread_id`,
+  Antigravity `conversation_id`) is announced once as `:session_identified`, and a usage-limit
+  rejection (Claude's `rate_limit_event` with `status: "rejected"` and a unix `resetsAt`; else the
+  "hit your … limit · resets 1am (UTC)" text) turns the nonzero exit into
+  `{:usage_limit, %{resets_at, limit_type, message, tail}}`. Adapters' `parse_output/3` runs only
+  after a clean exit, which is why this can't live there. Every check is substring-gated before any
+  `Jason.decode`, and the text pattern ends in `\b` (`rate limiter` is not a limit).
+- **Parking, not failing.** `AgentRunner` exits `{:shutdown, {:usage_limit, info}}`; the
+  orchestrator's `park_usage_limited/4` keeps `failures`, schedules the retry at reset + 60s
+  (`@usage_limit_grace_ms`; 30 min when unknown), and records `usage_limits[{kind, provider}]`.
+  `usage_block_until/3` holds waiting issues and firing retries while every provider they could
+  use is limited; `select_provider/1` skips limited providers. A `:turn_completed` on the pair
+  clears it. "Retry now" passes `force: true` and skips the gate.
+- **Resume.** The running entry's `resume_session_id` (never the display placeholder `"new"` that
+  `session_id` holds) is copied into `state.resumable` when a run is killed, crashes, stalls, is
+  restarted with a new spec, or is parked. `resume_opts/4` passes it to the next dispatch only for
+  the same agent kind **and** worker host. `AgentRunner` then sends a short "Resuming after an
+  interruption" prompt instead of the task prompt; if the resumed turn fails before the CLI prints
+  a session id it re-runs the turn fresh. A clean finish, a terminal ticket, abandonment, or the
+  third consecutive failure (`@resume_failure_cap`) clears it; `prune_resumable/2` drops issues
+  that are no longer candidates.
+- **Durable state.** `Orchestrator.DurableState` writes `~/.cymphony/orchestrator_state.json`
+  (0600, per project, atomic) from `checkpoint/1`, which compares a snapshot and writes only on
+  change. Retries carry `due_at_wall_ms` because `due_at_ms` is monotonic. `restore_durable_state/2`
+  in `init/1` re-arms retries, turns interrupted runs into due-now resumable retries, and drops
+  expired limits. **Disabled under `mix test`** (`durable_orchestrator_state: false` in
+  `config/config.exs`) — tests that need it set `:orchestrator_state_file` to a temp path.
+
+### Manual issues (`queue-add`)
+
+`projects[].manual_issues` (persisted via `CymphonyConfig.update_project_queue/2`) lists issue
+ids queued by hand. `fetch_dispatch_candidates/1` fetches any the candidate query did not return
+by id and marks every manual issue `assigned_to_worker: true` — the same marking is applied in
+running-state reconciliation and dispatch revalidation, or a manual issue assigned to someone else
+would be stopped as "no longer routed". Adding refuses terminal issues and moves one outside the
+active states to the first `queued_states` entry; terminal or vanished manual issues are pruned.
+Lookup is by `fetch_issue_states_by_ids/2`, which takes a readable id on YouTrack and the Memory
+tracker; Linear needs its issue UUID.
 
 ### Stall watchdog (`stall_timeout_ms`)
 
@@ -928,6 +975,8 @@ The Phoenix LiveView dashboard (`lib/cymphony_elixir_web/live/dashboard_live.ex`
 | `toggle_queue_edit` | Params `project` + `issue`. Toggle `{project, identifier}` in assign `:queue_edit_ids`. |
 | `preview_queue_run_spec` | Draft `:queue_run_spec_drafts[{project, id}]` like `preview_issue_run_spec`. Kind change clears model/effort. No persist. No provider. |
 | `set_queue_run_spec` | Hidden `project` + `issue`. Comboboxes preselect the card pin or the project header spec (no `keep`). Empty / keep in the payload still skip. `Control.set_queue_pin`. Does **not** kill (issue is not running). |
+| `add_queue_issue` | Project header "add issue" field: `Control.add_manual_issue/2` in a task, result back as `{:queue_add_result, key, issue, result}` (flash; clears the `queue-add:<project>` draft on success) |
+| `remove_queue_issue` | "Remove" on a card marked **Manual**: `Control.remove_manual_issue/2` |
 | `toggle_harness_follow` | Flip Follow/Paused on the expanded session's Harness stdout pane |
 | `pause_dispatch` / `resume_dispatch` | Stop/start dispatching new issues for **all** projects; running sessions complete normally. `Control.pause/resume` persists `dispatch_paused` per project; a persist failure flashes an error (the orchestrators still paused) instead of reporting success |
 | `toggle_project_pause` | Pause or resume dispatching for a single project from its section header. Goes through `Control.pause/resume({:project, name})` (never `Orchestrator.pause/1` directly) so it persists like the global buttons; a persist failure flashes "applied, but could not be saved" and still reloads the board |
@@ -1013,6 +1062,8 @@ Routes defined in `lib/cymphony_elixir_web/router.ex`:
 | `/api/v1/agent` | POST | Update agent settings at runtime. JSON body `{"kind": "codex", "model": "...", "effort": "..."}` (each optional, at least one required; `kind` must be one of `claude`, `codex`, `antigravity`; empty string clears model/effort), optional `?project=<name>`. Persists to `~/.cymphony/config.json`, rewrites the project's generated `WORKFLOW.md`, and overlays `config.json` so `snapshot.agent_kind` survives refresh. Applies to next dispatch. Returns 202. |
 | `/api/v1/queue` | POST | Sticky waiting order. Body `{"order":["LLM-51","LLM-12"]}`. Query `?project=` **required**. `202` `{"order":[...],"project":"Name"}` or `422` `{"error":{"code":"invalid_queue_order","message":"..."}}`. Declare (and `match :*`) **before** `/api/v1/:issue_identifier`. Other methods `405`. No Linear writes. |
 | `/api/v1/queue-pin` | POST | Pin `agent_kind` / model / effort for a waiting issue. Body `{"issue":"LLM-51","kind":"codex","model":"...","effort":"..."}` (each of kind/model/effort optional; empty/`keep` skipped; at least one real field). Query `?project=` **required**. `202` `{"issue","agent_kind","model","effort","project"}` or `422` `invalid_queue_pin`. Declare (and `match :*`) **before** `/api/v1/:issue_identifier`. Other methods `405`. Does not kill. No provider. No Linear writes. |
+| `/api/v1/queue-add` | POST | Queue an issue by hand. Body `{"issue":"HFE-1234"}`, `?project=` **required**. `202` `{issue, issue_id, state, title, project}`; `422` `invalid_queue_add` / `project_not_found` / `issue_not_found` / `issue_terminal` / `state_update_failed` / `queue_add_failed`. Declare (and `match :*`) before `/api/v1/:issue_identifier`. |
+| `/api/v1/queue-remove` | POST | Stop polling a hand-added issue (`{"issue": …}`, `?project=` required). `202` or `422` `not_manual` / `invalid_queue_remove`. Does not kill a running session. |
 | `/api/v1/completed` | GET | Recent completed sessions (last 100, in-memory ring buffer). Optional `?project=<name>` and `?limit=N`. |
 
 All other methods return 405; all other paths return 404.

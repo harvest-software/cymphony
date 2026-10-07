@@ -309,6 +309,18 @@ defmodule CymphonyElixir.Cymphony.ConfigPersistenceTest do
   end
 
   describe "update_project_queue/2" do
+    test "persists manual_issues as a trimmed id list on the named project", %{path: path} do
+      write_config!(path, %{"projects" => [%{"name" => "alpha"}, %{"name" => "beta"}]})
+
+      assert {:ok, updated} = CymphonyConfig.update_project_queue("alpha", %{"manual_issues" => [" HFE-1 ", "", "HFE-2"]})
+      alpha = Enum.find(updated["projects"], &(&1["name"] == "alpha"))
+      beta = Enum.find(updated["projects"], &(&1["name"] == "beta"))
+      assert alpha["manual_issues"] == ["HFE-1", "HFE-2"]
+      refute Map.has_key?(beta, "manual_issues")
+
+      assert {:error, :invalid_queue} = CymphonyConfig.update_project_queue("alpha", %{"manual_issues" => "HFE-1"})
+    end
+
     test "updates only the named project and sets 0o600", %{path: path} do
       write_config!(path, %{
         "dashboard_refresh_seconds" => 9,

@@ -169,6 +169,44 @@ defmodule CymphonyElixirWeb.DashboardLive do
     {:noreply, send_issue_command(socket, issue_identifier, :retry_issue_now)}
   end
 
+  # The tracker lookup (and possibly a state move) is a network round trip, so
+  # it runs off the LiveView process and reports back.
+  @impl true
+  def handle_event("add_queue_issue", %{"project" => project, "value" => value}, socket)
+      when is_binary(project) and is_binary(value) do
+    case String.trim(value) do
+      "" ->
+        {:noreply, put_flash(socket, :error, "Type an issue id, such as HFE-1234.")}
+
+      issue ->
+        pid = self()
+        key = "queue-add:#{project}"
+
+        Task.Supervisor.start_child(CymphonyElixir.TaskSupervisor, fn ->
+          send(pid, {:queue_add_result, key, issue, Control.add_manual_issue(project, issue)})
+        end)
+
+        {:noreply, put_flash(socket, :info, "Looking up #{issue}…")}
+    end
+  end
+
+  def handle_event("add_queue_issue", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("remove_queue_issue", %{"project" => project, "issue" => issue}, socket)
+      when is_binary(project) and is_binary(issue) do
+    socket =
+      case Control.remove_manual_issue(project, issue) do
+        :ok -> put_flash(socket, :info, "#{issue} is no longer queued by hand.")
+        {:error, reason} -> put_flash(socket, :error, "Could not remove #{issue}: #{inspect(reason)}")
+      end
+
+    Process.send_after(self(), :clear_flash, 3_000)
+    {:noreply, reload_payload_now(socket)}
+  end
+
+  def handle_event("remove_queue_issue", _params, socket), do: {:noreply, socket}
+
   @impl true
   def handle_event("refresh_now", _params, socket) do
     pid = self()
@@ -578,6 +616,26 @@ defmodule CymphonyElixirWeb.DashboardLive do
   @impl true
   def handle_info(:reload_payload_now, socket) do
     {:noreply, reload_payload_now(socket)}
+  end
+
+  @impl true
+  def handle_info({:queue_add_result, key, _issue, {:ok, added}}, socket) do
+    Process.send_after(self(), :clear_flash, 4_000)
+
+    socket =
+      socket
+      |> update(:field_drafts, &Map.delete(&1, key))
+      |> put_flash(:info, "Queued #{added.identifier} (#{added.state}).")
+
+    {:noreply, reload_payload_now(socket)}
+  end
+
+  def handle_info({:queue_add_result, _key, issue, {:error, reason}}, socket) do
+    {:noreply, put_flash(socket, :error, queue_add_error(issue, reason))}
+  end
+
+  def handle_info({:queue_add_result, _key, issue, other}, socket) do
+    {:noreply, put_flash(socket, :error, queue_add_error(issue, other))}
   end
 
   @impl true
@@ -1028,6 +1086,9 @@ defmodule CymphonyElixirWeb.DashboardLive do
                   <%= if Map.get(project, :paused, false) do %>
                     <span class="chip chip--warn">Paused</span>
                   <% end %>
+                  <%= if usage_limit_label(project) do %>
+                    <span class="chip chip--limit" title={usage_limit_title(project)}><%= usage_limit_label(project) %></span>
+                  <% end %>
                 </h2>
                 <p class="project-section-counts">
                   <span class="numeric"><%= Map.get(project, :running_count, length(project.running)) %></span>
@@ -1087,6 +1148,28 @@ defmodule CymphonyElixirWeb.DashboardLive do
                 >
                   <%= if Map.get(project, :paused, false), do: "Resume", else: "Pause" %>
                 </button>
+
+                <form
+                  phx-change="preview_field"
+                  phx-submit="add_queue_issue"
+                  class="inline-form queue-add-form"
+                >
+                  <input type="hidden" name="project" value={project.name} />
+                  <input type="hidden" name="field" value={"queue-add:#{project.name}"} />
+                  <label class="inline-label" for={"queue-add-#{project.name}"}>add issue</label>
+                  <input
+                    id={"queue-add-#{project.name}"}
+                    type="text"
+                    name="value"
+                    placeholder="HFE-1234"
+                    autocomplete="off"
+                    value={field_value(@field_drafts, "queue-add:#{project.name}", "")}
+                    phx-debounce="400"
+                    class="inline-input inline-input--narrow"
+                    title="Queue an issue by id, even if it is not assigned to Cymphony or is outside the polling scope"
+                  />
+                  <button type="submit" class="subtle-button">Queue</button>
+                </form>
               </div>
             </header>
 
@@ -1180,13 +1263,23 @@ defmodule CymphonyElixirWeb.DashboardLive do
                     <%= if Map.get(entry, :held) do %>
                       <span class="chip chip--held" title="Dispatch is paused; this retry is not counting down">Held</span>
                     <% end %>
+                    <%= if Map.get(entry, :usage_limited_until) do %>
+                      <span class="chip chip--limit" title={"Waiting for the usage limit to reset at #{entry.usage_limited_until}"}>Usage limit</span>
+                    <% end %>
+                    <%= if Map.get(entry, :resumable) do %>
+                      <span class="chip chip--muted" title="The next attempt resumes the interrupted agent conversation">Resumes</span>
+                    <% end %>
                   </div>
                   <div class="retry-row-error advanced-only">
                     <%= if entry.error do %>
                       <span class="muted small mono"><%= String.slice(to_string(entry.error), 0, 120) %></span>
                     <% end %>
                   </div>
-                  <span class="retry-row-guidance simple-only">Cymphony will retry automatically.</span>
+                  <span class="retry-row-guidance simple-only">
+                    <%= if Map.get(entry, :usage_limited_until),
+                      do: "Cymphony will pick this up again once the usage limit resets.",
+                      else: "Cymphony will retry automatically." %>
+                  </span>
                   <button
                     type="button"
                     class="subtle-button"
@@ -1950,8 +2043,23 @@ defmodule CymphonyElixirWeb.DashboardLive do
           <% else %>
             <%= @entry.issue_identifier %>
           <% end %>
+          <%= if Map.get(@entry, :manual) do %>
+            <span class="chip chip--muted" title="Added by hand; polled by id regardless of assignee or scope">Manual</span>
+          <% end %>
         </div>
         <div class="queue-card-title"><%= @entry.issue_title %></div>
+        <%= if Map.get(@entry, :manual) do %>
+          <button
+            type="button"
+            class="queue-card-edit-toggle"
+            phx-click="remove_queue_issue"
+            phx-value-project={@project_name}
+            phx-value-issue={@entry.issue_id}
+            title="Stop polling this hand-added issue"
+          >
+            Remove
+          </button>
+        <% end %>
         <button
           type="button"
           class="queue-card-edit-toggle"
@@ -2647,6 +2755,43 @@ defmodule CymphonyElixirWeb.DashboardLive do
     |> Enum.filter(& &1)
     |> Enum.join(" ")
   end
+
+  # The earliest reset across the project's limited providers. Rendered from
+  # the payload (an absolute time), so it never needs a client clock.
+  defp usage_limit_label(project) do
+    case Map.get(project, :usage_limits, []) do
+      [_ | _] = limits ->
+        case limits |> Enum.map(& &1.resets_at) |> Enum.reject(&is_nil/1) |> Enum.sort() do
+          [until | _] -> "Usage limit · until #{short_utc(until)}"
+          [] -> "Usage limit"
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp usage_limit_title(project) do
+    project
+    |> Map.get(:usage_limits, [])
+    |> Enum.map_join("; ", fn limit -> "#{limit.agent_kind}/#{limit.provider || "default"} resets #{limit.resets_at}" end)
+  end
+
+  defp short_utc(iso) when is_binary(iso) do
+    case DateTime.from_iso8601(iso) do
+      {:ok, datetime, _offset} -> Calendar.strftime(datetime, "%H:%M UTC")
+      _ -> iso
+    end
+  end
+
+  defp queue_add_error(issue, :issue_not_found), do: "#{issue} was not found in the tracker."
+  defp queue_add_error(issue, {:issue_terminal, state}), do: "#{issue} is already #{state}."
+  defp queue_add_error(_issue, :not_found), do: "That project is not running."
+
+  defp queue_add_error(issue, {:state_update_failed, reason}),
+    do: "Could not move #{issue} to a queued state: #{inspect(reason)}"
+
+  defp queue_add_error(issue, reason), do: "Could not queue #{issue}: #{inspect(reason)}"
 
   defp queue_card_class(rank, editing?) do
     ["queue-card", rank == 0 && "queue-card--next", editing? && "is-editing"]

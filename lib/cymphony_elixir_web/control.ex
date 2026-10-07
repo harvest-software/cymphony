@@ -128,6 +128,48 @@ defmodule CymphonyElixirWeb.Control do
   end
 
   @doc """
+  Queues an issue by hand (`HFE-1234`) on one project.
+
+  The project's orchestrator fetches it by id, refuses a finished one, moves
+  one sitting outside the active states to the first queued state, and
+  persists it under `projects[].manual_issues` so it is polled by id on every
+  tick — the tracker query's assignee and `scope_issue` filters no longer
+  decide whether it is seen.
+  """
+  @spec add_manual_issue(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
+  def add_manual_issue(project, issue) when is_binary(project) and is_binary(issue) do
+    with {:ok, server} <- project_orchestrator(project) do
+      unavailable_as_error(Orchestrator.add_manual_issue(server, issue))
+    end
+  end
+
+  @doc "Stops polling a hand-added issue by id. A running session is not touched."
+  @spec remove_manual_issue(String.t(), String.t()) :: :ok | {:error, term()}
+  def remove_manual_issue(project, issue) when is_binary(project) and is_binary(issue) do
+    with {:ok, server} <- project_orchestrator(project) do
+      unavailable_as_error(Orchestrator.remove_manual_issue(server, issue))
+    end
+  end
+
+  defp unavailable_as_error(:unavailable), do: {:error, :unavailable}
+  defp unavailable_as_error(result), do: result
+
+  # The named project's orchestrator, or the single legacy one when no
+  # per-project supervisors are registered (WORKFLOW.md mode).
+  defp project_orchestrator(name) do
+    case ProjectSupervisor.lookup(name, :orchestrator) do
+      pid when is_pid(pid) ->
+        {:ok, pid}
+
+      _ ->
+        case {ProjectSupervisor.list_orchestrators(), live_legacy_orchestrator()} do
+          {[], server} when not is_nil(server) -> {:ok, server}
+          _ -> {:error, :not_found}
+        end
+    end
+  end
+
+  @doc """
   Linear connect status for the dashboard and `GET /api/v1/linear`.
 
   Never includes the raw API key — `masked_key` is `mask_linear_api_key/1`.

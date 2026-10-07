@@ -12,6 +12,7 @@ defmodule CymphonyElixir.Agent.Runner do
   require Logger
 
   alias CymphonyElixir.{Agent, Config, PathSafety, SSH, Text}
+  alias CymphonyElixir.Agent.StreamSignals
   alias CymphonyElixir.Cymphony.ShellProvider
   alias CymphonyElixir.Mcp.ConfigWriter
   alias CymphonyElixir.YouTrack.Client, as: YouTrackClient
@@ -39,6 +40,7 @@ defmodule CymphonyElixir.Agent.Runner do
   @harness_stdout_max 2048
   @port_eof_drain_ms 250
   @shell_env_name_pattern "^[A-Za-z_][A-Za-z0-9_]*$"
+  @stream_signals_key {__MODULE__, :stream_signals}
 
   @type session :: %{
           port: port() | nil,
@@ -409,6 +411,7 @@ defmodule CymphonyElixir.Agent.Runner do
 
   defp await_process_completion(port, on_message, metadata, run_spec, agent_module, config) do
     wrapped = wrap_on_message(on_message, metadata)
+    Process.put(@stream_signals_key, %{kind: run_spec.kind, session_id: nil, usage_limit: nil})
 
     case collect_output(port, config, wrapped) do
       {:ok, lines} ->
@@ -444,7 +447,7 @@ defmodule CymphonyElixir.Agent.Runner do
       {^port, {:data, {:eol, chunk}}} ->
         line = buffer <> to_string(chunk)
         log_stream_line(line)
-        emit_harness_stdout(on_message, line)
+        emit_line(on_message, line)
         collect_output(port, "", [line | acc], config, on_message, eof?)
 
       {^port, {:data, {:noeol, chunk}}} ->
@@ -474,7 +477,7 @@ defmodule CymphonyElixir.Agent.Runner do
       {^port, {:data, {:eol, chunk}}} ->
         line = buffer <> to_string(chunk)
         log_stream_line(line)
-        emit_harness_stdout(on_message, line)
+        emit_line(on_message, line)
         drain_port_until_eof(port, "", [line | acc], on_message)
 
       {^port, {:data, {:noeol, chunk}}} ->
@@ -493,7 +496,7 @@ defmodule CymphonyElixir.Agent.Runner do
 
     if remaining != "" do
       log_stream_line(remaining)
-      emit_harness_stdout(on_message, remaining)
+      emit_line(on_message, remaining)
     end
 
     lines = if remaining != "", do: [remaining | acc], else: acc
@@ -503,8 +506,56 @@ defmodule CymphonyElixir.Agent.Runner do
   defp finalize_collected_output(status, buffer, acc, _on_message) do
     remaining = buffer |> to_string() |> String.trim()
     if remaining != "", do: log_stream_line(remaining)
-    {:error, {:agent_exit, status, failure_tail(acc, remaining)}}
+    tail = failure_tail(acc, remaining)
+
+    # A CLI that was refused by its usage limit exits nonzero like any crash.
+    # Saying so is what lets the orchestrator park the issue until the window
+    # resets instead of burning its retry budget on attempts that cannot run.
+    case stream_signals() do
+      %{usage_limit: %{} = limit} -> {:error, {:usage_limit, Map.put(limit, :tail, tail)}}
+      _ -> {:error, {:agent_exit, status, tail}}
+    end
   end
+
+  # Every completed stdout line: the live harness ring, plus the two facts that
+  # must be read before the CLI exits — its session id (so an interrupted run
+  # can be resumed) and a usage-limit rejection. The per-turn accumulator lives
+  # in the process dictionary because the collect loop is shared by both the
+  # read and the drain paths and is otherwise stateless about content.
+  defp emit_line(on_message, line) do
+    observe_stream_line(on_message, line)
+    emit_harness_stdout(on_message, line)
+  end
+
+  defp observe_stream_line(on_message, line) do
+    case stream_signals() do
+      %{kind: kind} = signals ->
+        signals
+        |> observe_session_id(StreamSignals.session_id(kind, line), on_message)
+        |> observe_usage_limit(StreamSignals.usage_limit(line, System.os_time(:second)), on_message)
+        |> then(&Process.put(@stream_signals_key, &1))
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp observe_session_id(%{session_id: id} = signals, id, _on_message), do: signals
+  defp observe_session_id(signals, nil, _on_message), do: signals
+
+  defp observe_session_id(signals, id, on_message) do
+    on_message.(%{event: :session_identified, session_id: id, timestamp: DateTime.utc_now()})
+    %{signals | session_id: id}
+  end
+
+  defp observe_usage_limit(signals, nil, _on_message), do: signals
+
+  defp observe_usage_limit(signals, limit, on_message) do
+    on_message.(%{event: :usage_limit, payload: limit, timestamp: DateTime.utc_now()})
+    %{signals | usage_limit: limit}
+  end
+
+  defp stream_signals, do: Process.get(@stream_signals_key)
 
   # A CLI that rejects its arguments prints a complete, newline-terminated
   # error line and exits: by then the line has moved into `acc` and the

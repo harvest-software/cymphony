@@ -583,7 +583,7 @@ defmodule CymphonyElixir.Cymphony.Config do
     end)
   end
 
-  @queue_attr_keys ["queue_order", "queue_pins", "queue_priority_seen"]
+  @queue_attr_keys ["queue_order", "queue_pins", "queue_priority_seen", "manual_issues"]
   @queue_pin_field_keys ["agent_kind", "model", "effort"]
 
   @doc """
@@ -591,7 +591,9 @@ defmodule CymphonyElixir.Cymphony.Config do
 
   Accepts any of `"queue_order"` (list of identifier binaries), `"queue_pins"`
   (identifier => `%{"agent_kind"|"model"|"effort" => binary}`), and
-  `"queue_priority_seen"` (identifier => integer | nil). Empty pin fields and
+  `"queue_priority_seen"` (identifier => integer | nil), and `"manual_issues"`
+  (list of issue ids added by hand from the dashboard or API, polled even when
+  the tracker query would not return them). Empty pin fields and
   empty pin entries are dropped. Provided keys replace the stored value
   (`queue_pins` is the full map, not a per-id patch).
 
@@ -636,6 +638,7 @@ defmodule CymphonyElixir.Cymphony.Config do
   defp sanitize_queue_attr("queue_order", value), do: sanitize_queue_order(value)
   defp sanitize_queue_attr("queue_pins", value), do: sanitize_queue_pins(value)
   defp sanitize_queue_attr("queue_priority_seen", value), do: sanitize_queue_priority_seen(value)
+  defp sanitize_queue_attr("manual_issues", value), do: sanitize_queue_order(value)
 
   defp sanitize_queue_order(order) when is_list(order), do: collect_queue_ids(order)
   defp sanitize_queue_order(_order), do: :error

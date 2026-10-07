@@ -2427,6 +2427,15 @@ form.project-agent-form {
   background: var(--surface-deep);
 }
 
+/* Usage limit = waiting out a provider's window. It is something the
+   operator should notice (nothing on that provider will run until the reset),
+   so it keeps the amber voice, but it is not a failure: no fill, like Paused. */
+.chip--limit {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 35%, transparent);
+  white-space: nowrap;
+}
+
 /* Long model names (gemini-3.7-flash-high) have to truncate before they push
    the tag cluster into a second line and eat the title. `display` must be
    overridden: `.chip` is `inline-flex`, `text-overflow` never applies to a flex
