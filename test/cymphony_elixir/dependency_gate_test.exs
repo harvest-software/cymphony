@@ -93,6 +93,8 @@ defmodule CymphonyElixir.DependencyGateTest do
         project_name: "gate-test-#{System.unique_integer([:positive])}",
         repo_url: origin,
         forge: Keyword.get(opts, :forge, "github"),
+        forge_token: Keyword.get(opts, :forge_token),
+        forge_host: Keyword.get(opts, :forge_host),
         forge_checker: Keyword.get(opts, :forge_checker, stub_forge(:blocked))
       )
 
@@ -271,6 +273,63 @@ defmodule CymphonyElixir.DependencyGateTest do
 
       assert log =~ "Forge merge check failed"
       assert DependencyGate.forge_verdict(:error, "gh", "a", "b") == :unknown
+    end
+
+    # The real checker against a stand-in `glab` that, like the real one, only
+    # knows a self-hosted instance when GITLAB_HOST names it.
+    test "the real check gives glab the project's forge host and token", %{root: root} do
+      bin = Path.join(root, "bin")
+      File.mkdir_p!(bin)
+      glab = Path.join(bin, "glab")
+
+      File.write!(glab, """
+      #!/bin/sh
+      if [ "$GITLAB_HOST" = "gitlab.example.com" ] && [ "$GITLAB_TOKEN" = "t0ken" ]; then
+        echo '[{"iid": 1}]'
+        exit 0
+      fi
+      echo 'none of the git remotes configured for this repository point to a known GitLab host' >&2
+      exit 1
+      """)
+
+      File.chmod!(glab, 0o755)
+
+      previous_path = System.get_env("PATH")
+      previous_host = System.get_env("GITLAB_HOST")
+      previous_token = System.get_env("GITLAB_TOKEN")
+      System.put_env("PATH", bin <> ":" <> previous_path)
+      System.delete_env("GITLAB_HOST")
+      System.delete_env("GITLAB_TOKEN")
+
+      on_exit(fn ->
+        System.put_env("PATH", previous_path)
+        if previous_host, do: System.put_env("GITLAB_HOST", previous_host)
+        if previous_token, do: System.put_env("GITLAB_TOKEN", previous_token)
+      end)
+
+      env = CymphonyElixir.ForgeEnv.cli_env("gitlab", "t0ken", "gitlab.example.com")
+      assert DependencyGate.forge_cli_merged?(root, "gitlab", "HFE-6472", "HFE-6470", env) == :merged
+
+      # Without the project's host the CLI sees only the daemon's environment.
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert DependencyGate.forge_cli_merged?(root, "gitlab", "HFE-6472", "HFE-6470") == :unknown
+        end)
+
+      assert log =~ "known GitLab host"
+    end
+
+    test "the gate builds the forge environment from the project's token and host", %{origin: origin} do
+      pid = start_gate!(origin, forge: "gitlab", forge_token: "t0ken", forge_host: "gitlab.example.com")
+
+      assert :sys.get_state(pid).forge_env == %{
+               "GITLAB_TOKEN" => "t0ken",
+               "GLAB_TOKEN" => "t0ken",
+               "GITLAB_HOST" => "gitlab.example.com"
+             }
+
+      # A project without them adds nothing, so whatever the daemon inherited still applies.
+      assert :sys.get_state(start_gate!(origin, forge: "gitlab")).forge_env == %{}
     end
   end
 

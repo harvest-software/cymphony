@@ -11,7 +11,7 @@ defmodule CymphonyElixir.Agent.Runner do
 
   require Logger
 
-  alias CymphonyElixir.{Agent, Config, PathSafety, SSH, Text, Workspace}
+  alias CymphonyElixir.{Agent, Config, ForgeEnv, PathSafety, SSH, Text, Workspace}
   alias CymphonyElixir.Agent.{OutputWindow, PortGuard, StreamSignals}
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
   alias CymphonyElixir.Cymphony.ShellProvider
@@ -372,17 +372,8 @@ defmodule CymphonyElixir.Agent.Runner do
 
   # The agent drives `glab`/`gh` itself, so it needs the forge credential in
   # its own (curated) environment under the names those CLIs read.
-  defp forge_env(%{forge: "gitlab"} = config) do
-    %{}
-    |> maybe_put_env("GITLAB_TOKEN", Map.get(config, :forge_token))
-    |> maybe_put_env("GLAB_TOKEN", Map.get(config, :forge_token))
-    |> maybe_put_env("GITLAB_HOST", Map.get(config, :forge_host))
-  end
-
-  defp forge_env(%{forge: _} = config) do
-    %{}
-    |> maybe_put_env("GH_TOKEN", Map.get(config, :forge_token))
-    |> maybe_put_env("GITHUB_TOKEN", Map.get(config, :forge_token))
+  defp forge_env(%{forge: forge} = config) do
+    ForgeEnv.cli_env(forge, Map.get(config, :forge_token), Map.get(config, :forge_host))
   end
 
   defp forge_env(_config), do: %{}

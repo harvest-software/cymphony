@@ -63,9 +63,18 @@ defmodule CymphonyElixir.ProjectSupervisor do
     with {:ok, config} <- CymphonyConfig.load(),
          {:ok, project} <- CymphonyConfig.find_project(config, project_name),
          repo_url when repo_url != "" <- CymphonyConfig.repo_url(project) do
-      [
-        {DependencyGate, name: via_tuple(project_name, :dependency_gate), project_name: project_name, repo_url: clone_url(project, repo_url), forge: Map.get(project, "forge", "github")}
+      opts = [
+        name: via_tuple(project_name, :dependency_gate),
+        project_name: project_name,
+        repo_url: clone_url(project, repo_url),
+        forge: Map.get(project, "forge", "github"),
+        # The merge check runs glab/gh itself, so it needs the same credential and
+        # host the agents are given.
+        forge_token: Map.get(project, "forge_token"),
+        forge_host: Map.get(project, "forge_host")
       ]
+
+      [{DependencyGate, opts}]
     else
       _ -> []
     end

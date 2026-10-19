@@ -44,6 +44,7 @@ defmodule CymphonyElixir.DependencyGate do
   require Logger
 
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
+  alias CymphonyElixir.ForgeEnv
 
   @ttl_ms 60_000
   @fetch_interval_ms 60_000
@@ -60,6 +61,7 @@ defmodule CymphonyElixir.DependencyGate do
       :forge,
       :mirror_path,
       :forge_checker,
+      forge_env: %{},
       git_timeout_ms: nil,
       ready?: false,
       refs: MapSet.new(),
@@ -96,11 +98,17 @@ defmodule CymphonyElixir.DependencyGate do
 
   @impl true
   def init(opts) do
+    forge = Keyword.get(opts, :forge, "github")
+    # The project's forge credential and host, under the names glab/gh read; the
+    # CLI otherwise sees only the daemon's environment, which has neither.
+    forge_env = ForgeEnv.cli_env(forge, Keyword.get(opts, :forge_token), Keyword.get(opts, :forge_host))
+
     state = %State{
       project_name: Keyword.fetch!(opts, :project_name),
       repo_url: Keyword.fetch!(opts, :repo_url),
-      forge: Keyword.get(opts, :forge, "github"),
-      forge_checker: Keyword.get(opts, :forge_checker, &__MODULE__.forge_cli_merged?/4),
+      forge: forge,
+      forge_env: forge_env,
+      forge_checker: Keyword.get(opts, :forge_checker, default_forge_checker(forge_env)),
       git_timeout_ms: Keyword.get(opts, :git_timeout_ms, @git_timeout_ms),
       mirror_path: mirror_path(Keyword.fetch!(opts, :project_name))
     }
@@ -230,13 +238,19 @@ defmodule CymphonyElixir.DependencyGate do
   depended on either being installed and authenticated would be testing the
   operator's machine rather than the gate.
   """
-  @spec forge_cli_merged?(String.t(), String.t(), String.t(), String.t()) :: verdict()
-  def forge_cli_merged?(mirror, forge, dep_branch, base_branch) do
+  @spec forge_cli_merged?(String.t(), String.t(), String.t(), String.t(), %{String.t() => String.t()}) :: verdict()
+  def forge_cli_merged?(mirror, forge, dep_branch, base_branch, env \\ %{}) do
     {cli, args} = forge_query(forge, dep_branch, base_branch)
 
     cli
-    |> cmd(args, mirror, @forge_timeout_ms)
+    |> cmd(args, mirror, @forge_timeout_ms, env)
     |> forge_verdict(cli, dep_branch, base_branch)
+  end
+
+  # Checkers are called with four arguments (tests replace them), so the real
+  # one closes over the forge environment rather than taking it per call.
+  defp default_forge_checker(env) do
+    fn mirror, forge, dep_branch, base_branch -> forge_cli_merged?(mirror, forge, dep_branch, base_branch, env) end
   end
 
   @doc """
@@ -340,10 +354,12 @@ defmodule CymphonyElixir.DependencyGate do
 
   defp git(mirror, args, timeout_ms), do: cmd("git", ["-C", mirror | args], File.cwd!(), timeout_ms)
 
-  defp cmd(binary, args, cd, timeout_ms) do
+  # `env` is added to the inherited environment, overriding a same-named
+  # variable, so the project's config wins over the daemon's shell.
+  defp cmd(binary, args, cd, timeout_ms, env \\ %{}) do
     task =
       Task.async(fn ->
-        System.cmd(binary, args, stderr_to_stdout: true, cd: cd)
+        System.cmd(binary, args, stderr_to_stdout: true, cd: cd, env: Enum.to_list(env))
       end)
 
     case Task.yield(task, timeout_ms) do
