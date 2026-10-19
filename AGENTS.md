@@ -157,8 +157,9 @@ started only when the project has a `repo_url`). Per dependency:
 1. no mirror / base ref missing / dependency branch missing → **tracker state decides**
    (branch missing is squash-then-delete *and* never-started, indistinguishable from here)
 2. `git merge-base --is-ancestor <dep> <base>` → **merged**
-3. else the forge (`glab mr list --source-branch … --target-branch … --state merged`, or
-   `gh pr list --head … --base …`) → **merged** if it returns a row
+3. else the forge (`glab mr list --source-branch … --target-branch … --merged`, or
+   `gh pr list --head … --base … --state merged`) → **merged** if it returns a row. The
+   state filter is spelled differently per CLI; `glab` rejects `--state`
 4. else **blocked**
 
 Step 3 is not optional: sub-task MRs are squash-merged, which rewrites the commits, so a

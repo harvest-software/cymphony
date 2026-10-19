@@ -243,7 +243,9 @@ defmodule CymphonyElixir.DependencyGateTest do
       assert {"glab", gitlab} = DependencyGate.forge_query("gitlab", "HFE-6472", "HFE-6470")
       assert "--source-branch" in gitlab
       assert "--target-branch" in gitlab
-      assert "merged" in gitlab
+      assert "--merged" in gitlab
+      # gh's spelling: glab rejects it ("Unknown flag: --state"), so every check came back :unknown
+      refute "--state" in gitlab
 
       assert {"gh", github} = DependencyGate.forge_query("github", "HFE-6472", "HFE-6470")
       assert "--head" in github

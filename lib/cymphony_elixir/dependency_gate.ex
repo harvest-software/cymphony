@@ -264,6 +264,9 @@ defmodule CymphonyElixir.DependencyGate do
 
   @doc """
   The forge CLI invocation that answers "was this branch merged into that one".
+
+  The two CLIs spell the state filter differently: `glab mr list` has a `--merged`
+  switch and rejects `gh`'s `--state merged` with "Unknown flag: --state".
   """
   @spec forge_query(String.t(), String.t(), String.t()) :: {String.t(), [String.t()]}
   def forge_query("gitlab", dep_branch, base_branch) do
@@ -275,8 +278,7 @@ defmodule CymphonyElixir.DependencyGate do
        dep_branch,
        "--target-branch",
        base_branch,
-       "--state",
-       "merged",
+       "--merged",
        "--output",
        "json"
      ]}
