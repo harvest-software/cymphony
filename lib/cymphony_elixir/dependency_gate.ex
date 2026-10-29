@@ -21,6 +21,13 @@ defmodule CymphonyElixir.DependencyGate do
   pre-check, and the forge (`glab` / `gh`) is the authority that settles
   anything ancestry calls unmerged.
 
+  Ancestry also over-claims in the other direction. A dependency branch pushed
+  before its first commit is the base's tip, or a strict ancestor once a sibling
+  lands, so it is "an ancestor of the base" with no work on it at all. The
+  pre-check therefore only answers `:merged` when the dependency's tip reached
+  the base through a merge commit, i.e. is not on the base's first-parent line.
+  A fast-forward also sits on that line and is left to the forge too.
+
   ## Why a GenServer
 
   `git fetch` and a forge CLI are network calls measured in seconds. The
@@ -213,10 +220,40 @@ defmodule CymphonyElixir.DependencyGate do
   end
 
   defp resolve(mirror, forge, checker, dep_branch, base_branch) do
-    if ancestor?(mirror, dep_branch, base_branch) do
+    if merged_in?(mirror, dep_branch, base_branch) do
       :merged
     else
       checker.(mirror, forge, dep_branch, base_branch)
+    end
+  end
+
+  # Ancestry proves a merge only when the dependency's tip came in through a
+  # merge commit. A tip on the base's own first-parent line is either a
+  # fast-forward or a branch that never diverged (an agent pushes its branch
+  # before its first commit, and that tip is trivially an ancestor of the base
+  # it was cut from). Git cannot tell those two apart, so the forge decides.
+  defp merged_in?(mirror, dep_branch, base_branch) do
+    ancestor?(mirror, dep_branch, base_branch) and
+      not on_first_parent_line?(mirror, dep_branch, base_branch)
+  end
+
+  # Walks the base's first parents back to where the dependency's history
+  # begins. Excluding `dep` stops the walk there, so the output is bounded by
+  # what landed since rather than by the life of the repository. The walk ends
+  # on the dependency's tip exactly when that tip is on the line. A git failure
+  # answers "on the line", which only sends the question on to the forge.
+  defp on_first_parent_line?(mirror, dep_branch, base_branch) do
+    range = ref(dep_branch) <> ".." <> ref(base_branch)
+
+    with {tip, 0} <- git(mirror, ["rev-parse", ref(dep_branch)], @git_timeout_ms),
+         {walk, 0} <- git(mirror, ["rev-list", "--first-parent", "--parents", range], @git_timeout_ms) do
+      case String.split(walk, "\n", trim: true) do
+        # Nothing between them: the dependency's tip is the base's tip.
+        [] -> true
+        lines -> lines |> List.last() |> String.split() |> Enum.at(1) == String.trim(tip)
+      end
+    else
+      _ -> true
     end
   end
 

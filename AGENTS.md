@@ -156,7 +156,11 @@ started only when the project has a `repo_url`). Per dependency:
 
 1. no mirror / base ref missing / dependency branch missing → **tracker state decides**
    (branch missing is squash-then-delete *and* never-started, indistinguishable from here)
-2. `git merge-base --is-ancestor <dep> <base>` → **merged**
+2. `git merge-base --is-ancestor <dep> <base>` **and** the dependency's tip is *not* on the
+   base's first-parent line (`rev-list --first-parent --parents <dep>..<base>` doesn't end on
+   it) → **merged**. A tip on that line is a branch that never diverged, e.g. one pushed before
+   its first commit, which is trivially an ancestor of the base. It could also be a
+   fast-forward. Git can't tell those apart, so step 3 decides
 3. else the forge (`glab mr list --source-branch … --target-branch … --merged`, or
    `gh pr list --head … --base … --state merged`) → **merged** if it returns a row. The
    state filter is spelled differently per CLI; `glab` rejects `--state`

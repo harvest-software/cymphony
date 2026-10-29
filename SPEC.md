@@ -1362,13 +1362,20 @@ from git and the forge first, with tracker state as the fallback:
 | 1 | No mirror for the project (no `repo_url`, clone failed) | fall back to tracker state |
 | 2 | The base branch is not a ref in the mirror | fall back to tracker state |
 | 3 | The dependency's branch is not a ref in the mirror | fall back to tracker state |
-| 4 | `git merge-base --is-ancestor <dep> <base>` succeeds | **ready** |
+| 4 | `git merge-base --is-ancestor <dep> <base>` succeeds **and** `<dep>`'s tip is not on `<base>`'s first-parent line | **ready** |
 | 5 | The forge reports a review from `<dep>` into `<base>` in state merged | **ready** |
 | 6 | Otherwise | **not ready** — the dependent stays queued |
 
 Rule 5 exists because sub-task reviews are routinely squash-merged, which rewrites the
 commits: a squashed dependency is never an ancestor of the base however thoroughly it
 landed. Ancestry is the fast local pre-check; the forge is the authority.
+
+Rule 4's first-parent condition exists because ancestry also over-claims. A dependency
+branch pushed before its first commit is the base's tip (or a strict ancestor once a
+sibling lands): an ancestor of the base with no work on it. Its tip sits on the base's
+first-parent line, and so does a fast-forwarded dependency. Git cannot tell the two apart,
+so both go to rule 5. Only a tip that reached the base through a merge commit is ready on
+ancestry alone. A git failure while walking the line also defers to rule 5.
 
 Rule 3 covers squash-then-delete and never-started alike — indistinguishable from the
 mirror, so the ticket is the tie-breaker.

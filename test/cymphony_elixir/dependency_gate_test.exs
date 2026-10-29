@@ -175,6 +175,67 @@ defmodule CymphonyElixir.DependencyGateTest do
     end
   end
 
+  test "a dependency branch with no commits of its own is not merged", %{origin: origin} do
+    # An agent cuts its branch from the base and pushes it before its first
+    # commit. Its tip *is* the base's tip, so it is trivially an ancestor of the
+    # base, but nothing has landed. Reading that as merged dispatched a
+    # dependent four minutes into its dependency's run.
+    git!(origin, ["branch", "HFE-6473", "HFE-6470"])
+
+    pid = start_gate!(origin, forge_checker: stub_forge(:blocked))
+    assert settle(pid, "HFE-6473", "HFE-6470") == :blocked
+  end
+
+  test "an empty dependency branch stays unmerged after the base moves on", %{origin: origin} do
+    # A sibling landing on the base makes the empty branch a strict ancestor
+    # rather than the tip itself; it still carries no work.
+    git!(origin, ["branch", "HFE-6473", "HFE-6470"])
+    commit!(origin, "three", "sibling lands on the epic")
+
+    pid = start_gate!(origin, forge_checker: stub_forge(:blocked))
+    assert settle(pid, "HFE-6473", "HFE-6470") == :blocked
+  end
+
+  test "an empty dependency branch with no forge answer falls back to the tracker", %{origin: origin} do
+    # `:unknown`, not `:merged`: the caller then holds on the ticket's state,
+    # which for a dependency that has only just started is non-terminal.
+    git!(origin, ["branch", "HFE-6473", "HFE-6470"])
+
+    pid = start_gate!(origin, forge_checker: stub_forge(:unknown))
+    assert settle(pid, "HFE-6473", "HFE-6470") == :unknown
+  end
+
+  test "an empty dependency branch unblocks once its work is merged in", %{origin: origin} do
+    # The early "not merged" must not stick: the same branch gains a commit and
+    # lands, and the dependent has to notice without a restart.
+    Application.put_env(:cymphony_elixir, :dependency_gate_ttl_ms, 0)
+    on_exit(fn -> Application.delete_env(:cymphony_elixir, :dependency_gate_ttl_ms) end)
+
+    git!(origin, ["branch", "HFE-6473", "HFE-6470"])
+    pid = start_gate!(origin, forge_checker: stub_forge(:blocked))
+    assert settle(pid, "HFE-6473", "HFE-6470") == :blocked
+
+    git!(origin, ["checkout", "-q", "HFE-6473"])
+    commit!(origin, "three", "sub-task three")
+    git!(origin, ["checkout", "-q", "HFE-6470"])
+    git!(origin, ["merge", "--no-ff", "-m", "merge three", "HFE-6473"])
+    send(pid, :scheduled_sync)
+
+    assert eventually_merged(pid, "HFE-6473", "HFE-6470")
+  end
+
+  test "a fast-forwarded dependency is settled by the forge, not by ancestry", %{origin: origin} do
+    # A fast-forward leaves the dependency's tip on the base's own line, which
+    # git cannot tell apart from a branch that never diverged. The forge can.
+    git!(origin, ["checkout", "-q", "-b", "HFE-6473", "HFE-6470"])
+    commit!(origin, "three", "sub-task three")
+    git!(origin, ["checkout", "-q", "HFE-6470"])
+    git!(origin, ["merge", "--ff-only", "HFE-6473"])
+
+    assert settle(start_gate!(origin, forge_checker: stub_forge(:merged)), "HFE-6473", "HFE-6470") == :merged
+    assert settle(start_gate!(origin, forge_checker: stub_forge(:blocked)), "HFE-6473", "HFE-6470") == :blocked
+  end
+
   test "a dependency with no branch on the remote is unknown, not blocked", %{origin: origin} do
     # Squash-then-delete leaves no branch, and so does a dependency that never
     # started — indistinguishable from here, so the caller's tracker-state test
@@ -351,9 +412,13 @@ defmodule CymphonyElixir.DependencyGateTest do
 
     # A new branch pushed after the initial sync is visible once the refresh
     # lands, which is what makes "a session just finished" worth reacting to.
-    git!(origin, ["branch", "HFE-6480", "HFE-6470"])
+    # A branch the mirror cannot see answers `:unknown`; a visible, unmerged
+    # one is resolved to `:blocked`.
+    git!(origin, ["checkout", "-q", "-b", "HFE-6480", "HFE-6470"])
+    commit!(origin, "eighty", "sub-task eighty")
+    git!(origin, ["checkout", "-q", "HFE-6470"])
     send(pid, :scheduled_sync)
-    assert settle(pid, "HFE-6480", "HFE-6470") == :merged
+    assert settle(pid, "HFE-6480", "HFE-6470") == :blocked
   end
 
   test "unrelated messages do not disturb the gate", %{origin: origin} do
