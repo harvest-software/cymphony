@@ -1620,6 +1620,8 @@ Manual issues:
 - `projects[].manual_issues` lists issue ids queued by hand (dashboard / `POST /api/v1/queue-add`).
   Each poll fetches any not returned by the candidate query by id and marks them routable, so the
   assignee and scope filters do not hide them; state, blocker and container rules still apply.
+- Adding refuses an issue the tracker reports as belonging to a different project than the one it
+  was added under, before any state write.
 - Adding refuses a terminal issue and moves one outside the active states to the first queued
   state. A manual issue that becomes terminal or disappears is dropped from the list.
 

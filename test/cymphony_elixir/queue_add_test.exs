@@ -32,6 +32,7 @@ defmodule CymphonyElixir.QueueAddTest do
           "GONE" -> {:error, :issue_not_found}
           "DONE" -> {:error, {:issue_terminal, "Done"}}
           "STUCK" -> {:error, {:state_update_failed, :forbidden}}
+          "ELSEWHERE" -> {:error, {:issue_other_project, "HC"}}
           _ -> {:error, :weird}
         end
 
@@ -106,6 +107,7 @@ defmodule CymphonyElixir.QueueAddTest do
             {"GONE", "issue_not_found"},
             {"DONE", "issue_terminal"},
             {"STUCK", "state_update_failed"},
+            {"ELSEWHERE", "issue_other_project"},
             {"OTHER", "queue_add_failed"}
           ] do
         body = json_response(post(build_conn(), "/api/v1/queue-add?project=hfe", %{"issue" => issue}), 422)

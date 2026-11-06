@@ -1351,6 +1351,7 @@ defmodule CymphonyElixir.DashboardLiveTest do
     for {reason, text} <- [
           {:issue_not_found, "HFE-9 was not found"},
           {{:issue_terminal, "Done"}, "HFE-9 is already Done"},
+          {{:issue_other_project, "HC"}, "HFE-9 belongs to the HC project"},
           {:not_found, "That project is not running"},
           {{:state_update_failed, :nope}, "Could not move HFE-9"}
         ] do

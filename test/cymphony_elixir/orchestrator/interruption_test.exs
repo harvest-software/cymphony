@@ -453,6 +453,23 @@ defmodule CymphonyElixir.Orchestrator.InterruptionTest do
       assert {:reply, {:error, {:issue_terminal, "Done"}}, _} = call(state, {:add_manual_issue, "MT-31"})
     end
 
+    test "an issue from another tracker project is refused before any state write" do
+      # Regression: HFE-6887 typed into the Harvest CRM box was moved through
+      # CRM's `Stage` field, which HFE issues lack — YouTrack answered 500.
+      Application.put_env(:cymphony_elixir, :memory_tracker_issues, [
+        issue("HFE-6887", "Backlog", project: "HFE"),
+        issue("MT-35", "Backlog", project: "PROJECT")
+      ])
+
+      state = base_state()
+
+      assert {:reply, {:error, {:issue_other_project, "HFE"}}, ^state} = call(state, {:add_manual_issue, "HFE-6887"})
+      refute_received {:memory_tracker_state_update, _, _}
+
+      # The configured slug matches case-insensitively.
+      assert {:reply, {:ok, _}, _} = quietly(fn -> call(state, {:add_manual_issue, "MT-35"}) end)
+    end
+
     test "a manual issue is queued even when it is not assigned to Cymphony, and pruned when finished or gone" do
       Application.put_env(:cymphony_elixir, :memory_tracker_issues, [
         issue("MT-32", "Todo", assigned_to_worker: false),

@@ -2709,6 +2709,7 @@ defmodule CymphonyElixir.Orchestrator do
     config = state_config(state)
 
     with {:ok, [%Issue{} = issue | _]} <- Tracker.fetch_issue_states_by_ids([issue_key], config),
+         :ok <- reject_other_project(issue, config),
          :ok <- reject_terminal(issue, state),
          {:ok, issue} <- ensure_dispatchable_state(issue, state) do
       key = issue.id || issue_key
@@ -2720,6 +2721,20 @@ defmodule CymphonyElixir.Orchestrator do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # A tracker that can name an issue's project (YouTrack) is asked whether it
+  # is *this* project's. Queued under the wrong project it would be moved
+  # through this project's state field (which its own project may not have)
+  # and then run against this project's repository.
+  defp reject_other_project(%Issue{project: project}, config) when is_binary(project) do
+    expected = config.tracker.project_slug
+
+    if is_binary(expected) and String.downcase(String.trim(expected)) != String.downcase(project),
+      do: {:error, {:issue_other_project, project}},
+      else: :ok
+  end
+
+  defp reject_other_project(_issue, _config), do: :ok
 
   defp reject_terminal(%Issue{state: issue_state}, state) do
     if terminal_issue_state?(issue_state, terminal_state_set(state)),

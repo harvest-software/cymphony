@@ -499,6 +499,12 @@ by id and marks every manual issue `assigned_to_worker: true` — the same marki
 running-state reconciliation and dispatch revalidation, or a manual issue assigned to someone else
 would be stopped as "no longer routed". Adding refuses terminal issues and moves one outside the
 active states to the first `queued_states` entry; terminal or vanished manual issues are pruned.
+An issue from another tracker project is refused (`{:issue_other_project, short_name}`) before any
+state write: YouTrack reports each issue's `project(shortName)`, which lands on `Issue.project` and is
+compared case-insensitively against `tracker.project_slug`. Without the check, `HFE-6887` typed into
+the Harvest CRM box was moved through CRM's `Stage` field, which HFE issues don't have, and YouTrack
+answered a bare 500 (`incompatible-issue-custom-field-name-Stage`). Linear leaves `project` `nil` and
+is not checked.
 Lookup is by `fetch_issue_states_by_ids/2`, which takes a readable id on YouTrack and the Memory
 tracker; Linear needs its issue UUID.
 
@@ -1113,7 +1119,7 @@ Routes defined in `lib/cymphony_elixir_web/router.ex`:
 | `/api/v1/agent` | POST | Update agent settings at runtime. JSON body `{"kind": "codex", "model": "...", "effort": "..."}` (each optional, at least one required; `kind` must be one of `claude`, `codex`, `antigravity`; empty string clears model/effort), optional `?project=<name>`. Persists to `~/.cymphony/config.json`, rewrites the project's generated `WORKFLOW.md`, and overlays `config.json` so `snapshot.agent_kind` survives refresh. Applies to next dispatch. Returns 202 only on full success; `422` `agent_settings_not_persisted` means the runtime change could not be fully saved/re-written. Also reports `project_not_found` / `invalid_scope`. |
 | `/api/v1/queue` | POST | Sticky waiting order. Body `{"order":["LLM-51","LLM-12"]}`. Query `?project=` **required**. `202` `{"order":[...],"project":"Name"}` or `422` `{"error":{"code":"invalid_queue_order","message":"..."}}`. Declare (and `match :*`) **before** `/api/v1/:issue_identifier`. Other methods `405`. No Linear writes. |
 | `/api/v1/queue-pin` | POST | Pin `agent_kind` / model / effort for a waiting issue. Body `{"issue":"LLM-51","kind":"codex","model":"...","effort":"..."}` (each of kind/model/effort optional; empty/`keep` skipped; at least one real field). Query `?project=` **required**. `202` `{"issue","agent_kind","model","effort","project"}` or `422` `invalid_queue_pin`. Declare (and `match :*`) **before** `/api/v1/:issue_identifier`. Other methods `405`. Does not kill. No provider. No Linear writes. |
-| `/api/v1/queue-add` | POST | Queue an issue by hand. Body `{"issue":"HFE-1234"}`, `?project=` **required**. `202` `{issue, issue_id, state, title, project}`; `422` `invalid_queue_add` / `project_not_found` / `issue_not_found` / `issue_terminal` / `state_update_failed` / `queue_add_failed`. Declare (and `match :*`) before `/api/v1/:issue_identifier`. |
+| `/api/v1/queue-add` | POST | Queue an issue by hand. Body `{"issue":"HFE-1234"}`, `?project=` **required**. `202` `{issue, issue_id, state, title, project}`; `422` `invalid_queue_add` / `project_not_found` / `issue_not_found` / `issue_other_project` / `issue_terminal` / `state_update_failed` / `queue_add_failed`. Declare (and `match :*`) before `/api/v1/:issue_identifier`. |
 | `/api/v1/queue-remove` | POST | Stop polling a hand-added issue (`{"issue": …}`, `?project=` required). `202` or `422` `not_manual` / `invalid_queue_remove`. Does not kill a running session. |
 | `/api/v1/completed` | GET | Recent completed sessions (last 100, in-memory ring buffer). Optional `?project=<name>` and `?limit=N`. |
 

@@ -2964,6 +2964,10 @@ defmodule CymphonyElixirWeb.DashboardLive do
 
   defp queue_add_error(issue, :issue_not_found), do: "#{issue} was not found in the tracker."
   defp queue_add_error(issue, {:issue_terminal, state}), do: "#{issue} is already #{state}."
+
+  defp queue_add_error(issue, {:issue_other_project, project}),
+    do: "#{issue} belongs to the #{project} project, not this one. Add it from that project's section."
+
   defp queue_add_error(_issue, :not_found), do: "That project is not running."
 
   defp queue_add_error(issue, {:state_update_failed, reason}),

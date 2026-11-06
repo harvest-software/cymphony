@@ -56,7 +56,11 @@ defmodule CymphonyElixir.YouTrack.Issue do
   # supposed to land?" rather than "is it on the branch I am cutting from".
   # Without it a dependency that merged into the epic branch would block a
   # dependent that cuts from the repository default, forever.
-  @fields "id,idReadable,summary,description,created,updated,tags(name)," <>
+  # `project(shortName)` lets a hand-queued issue be checked against the
+  # project it was queued under: an issue from another project has none of
+  # this project's custom fields, so moving it to a queued state fails with a
+  # bare 500 (`incompatible-issue-custom-field-name-Stage`).
+  @fields "id,idReadable,summary,description,created,updated,tags(name),project(shortName)," <>
             "customFields($type,name,value(name,login)),links(direction," <>
             "linkType(name,sourceToTarget,targetToSource)," <>
             "issues(id,idReadable,customFields(name,value(name))," <>
@@ -228,6 +232,7 @@ defmodule CymphonyElixir.YouTrack.Issue do
       assignee_id: assignee_login,
       parent_identifier: parent,
       version: version,
+      project: project_short_name(issue),
       branch_from_parent: branch_from_parent?(parent, version, opts),
       blocked_by: blockers(issue, state_field, opts),
       labels: labels(issue),
@@ -236,6 +241,9 @@ defmodule CymphonyElixir.YouTrack.Issue do
       updated_at: timestamp(issue["updated"])
     }
   end
+
+  defp project_short_name(%{"project" => %{"shortName" => name}}) when is_binary(name) and name != "", do: name
+  defp project_short_name(_issue), do: nil
 
   defp issue_url(base_url, readable), do: String.trim_trailing(base_url, "/") <> "/issue/" <> readable
 

@@ -110,6 +110,13 @@ defmodule CymphonyElixir.YouTrack.IssueTest do
     assert issue.updated_at == ~U[2023-11-14 22:14:20.000Z]
   end
 
+  test "records the issue's project short name" do
+    assert Issue.fields() =~ "project(shortName)"
+    assert Issue.normalize(raw(%{"project" => %{"shortName" => "LLM"}}), @base).project == "LLM"
+    assert Issue.normalize(raw(), @base).project == nil
+    assert Issue.normalize(raw(%{"project" => %{"shortName" => ""}}), @base).project == nil
+  end
+
   test "trims a trailing slash off the instance URL" do
     assert Issue.normalize(raw(), @base <> "/").url == "https://example.youtrack.cloud/issue/LLM-51"
   end

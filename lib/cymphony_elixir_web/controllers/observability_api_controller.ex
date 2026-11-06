@@ -475,6 +475,9 @@ defmodule CymphonyElixirWeb.ObservabilityApiController do
   defp manual_issue_error(conn, {:issue_terminal, state}),
     do: error_response(conn, 422, "issue_terminal", "The issue is already #{state}")
 
+  defp manual_issue_error(conn, {:issue_other_project, project}),
+    do: error_response(conn, 422, "issue_other_project", "The issue belongs to project #{project}")
+
   defp manual_issue_error(conn, {:state_update_failed, reason}),
     do: error_response(conn, 422, "state_update_failed", "Could not move the issue to a queued state: #{inspect(reason)}")
 
