@@ -161,6 +161,9 @@ defmodule CymphonyElixir.ShellProviderPrefixTest do
     assert ShellProvider.load_env(unique_provider()) == {:error, :not_found}
   end
 
+  # Runs the real zsh: the property is about what zsh resolves, so a stub
+  # would prove nothing. Without zsh it failed with `:enoent` instead.
+  @tag skip: if(System.find_executable("zsh"), do: false, else: "requires zsh on PATH")
   test "load_env never invokes an executable that is not a sourced shell function" do
     tmp = Path.join(System.tmp_dir!(), "cymphony-shell-provider-#{System.unique_integer([:positive])}")
     bin = Path.join(tmp, "bin")

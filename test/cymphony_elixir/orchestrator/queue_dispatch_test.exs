@@ -3,6 +3,15 @@ defmodule CymphonyElixir.Orchestrator.QueueDispatchTest do
 
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
 
+  # These tests assert on `running` after a dispatch, so the dispatched agent
+  # has to still be running when the snapshot is taken. The default
+  # `claude_command` launches the real CLI: where it is missing it exits 127
+  # within milliseconds and the issue drops into the retry queue before the
+  # assertion (flaky); where it is installed the test starts a real session.
+  # The adapter appends its own flags, which `bash -c` binds to `$0`/`$@`
+  # and ignores.
+  @stub_agent "bash -c 'sleep 30' cymphony-stub-agent"
+
   test "snapshot.waiting is empty before any fetch" do
     pid = start_queue_orchestrator(:EmptyWaiting)
 
@@ -195,7 +204,12 @@ defmodule CymphonyElixir.Orchestrator.QueueDispatchTest do
           ]
         })
 
-      write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", poll_interval_ms: 60_000)
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        poll_interval_ms: 60_000,
+        claude_command: @stub_agent
+      )
+
       put_issues([issue("iss-boot", "MT-BOOT", priority: 1, created_at: ~U[2026-01-01 00:00:00Z])])
 
       pid = start_named_orchestrator(:PausedBoot, project_name)
@@ -370,7 +384,7 @@ defmodule CymphonyElixir.Orchestrator.QueueDispatchTest do
 
     workflow =
       Keyword.merge(
-        [tracker_kind: "memory", poll_interval_ms: 60_000],
+        [tracker_kind: "memory", poll_interval_ms: 60_000, claude_command: @stub_agent],
         Keyword.get(opts, :workflow, [])
       )
 
