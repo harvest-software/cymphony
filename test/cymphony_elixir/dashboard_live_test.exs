@@ -1431,6 +1431,44 @@ defmodule CymphonyElixir.DashboardLiveTest do
              ~s(<span data-clock="elapsed" data-base-seconds="#{seconds}">#{div(seconds, 60)}m #{rem(seconds, 60)}s</span>)
   end
 
+  test "completed runs and the stalled banner link the issue number to its tracker page" do
+    start_dashboard()
+
+    {:ok, view, _html} = live(build_conn(), "/")
+
+    payload = view_payload(view)
+    [entry | rest] = payload.running
+
+    stalled =
+      entry
+      |> Map.put(:stalled, true)
+      |> Map.put(:last_event_at, DateTime.to_iso8601(DateTime.add(DateTime.utc_now(), -125, :second)))
+      |> Map.put(:issue_url, "https://youtrack.example.com/issue/#{entry.issue_identifier}")
+
+    completed =
+      Enum.map(
+        [
+          %{issue_id: "c1", identifier: "UAT-9", issue_url: "https://youtrack.example.com/issue/UAT-9"},
+          # Recorded before completions kept the URL: shown, but not linked.
+          %{issue_id: "c2", identifier: "UAT-8"}
+        ],
+        &Presenter.completed_entry_payload(Map.merge(%{project_name: "UAT Stacks", ended_at: DateTime.utc_now(), runtime_seconds: 60}, &1))
+      )
+
+    updated = %{payload | running: [stalled | rest], recent_completed: completed}
+    send(view.pid, test_payload_loaded(view, view_assigns(view).payload_seq, updated))
+
+    assert has_element?(view, ~s|.session-row--completed a[href="https://youtrack.example.com/issue/UAT-9"]|, "UAT-9")
+    refute has_element?(view, ".session-row--completed a", "UAT-8")
+    assert has_element?(view, ".session-row--completed", "UAT-8")
+
+    assert has_element?(
+             view,
+             ~s|.alert-banner a[href="https://youtrack.example.com/issue/#{entry.issue_identifier}"]|,
+             entry.issue_identifier
+           )
+  end
+
   test "clock spans drop their anchor when the amount is unknown, keeping the server text" do
     start_dashboard()
 

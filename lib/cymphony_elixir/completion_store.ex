@@ -30,6 +30,7 @@ defmodule CymphonyElixir.CompletionStore do
       workspace_path     TEXT,
       agent_kind         TEXT,
       model              TEXT,
+      issue_url          TEXT,
       PRIMARY KEY (issue_id, ended_at)
     )
     """,
@@ -55,7 +56,8 @@ defmodule CymphonyElixir.CompletionStore do
   # column" errors on fresh DBs are ignored.
   @column_adds [
     "ALTER TABLE sessions ADD COLUMN agent_kind TEXT",
-    "ALTER TABLE sessions ADD COLUMN model TEXT"
+    "ALTER TABLE sessions ADD COLUMN model TEXT",
+    "ALTER TABLE sessions ADD COLUMN issue_url TEXT"
   ]
 
   @max_limit 1000
@@ -219,8 +221,8 @@ defmodule CymphonyElixir.CompletionStore do
     INSERT OR REPLACE INTO sessions (
       issue_id, identifier, project_name, ended_at, started_at, runtime_seconds,
       input_tokens, output_tokens, total_tokens,
-      worker_host, workspace_path, agent_kind, model
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      worker_host, workspace_path, agent_kind, model, issue_url
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     with {:ok, stmt} <- Sqlite3.prepare(db, sql),
@@ -248,7 +250,8 @@ defmodule CymphonyElixir.CompletionStore do
       Map.get(record, :worker_host),
       Map.get(record, :workspace_path),
       Map.get(record, :agent_kind),
-      Map.get(record, :model)
+      Map.get(record, :model),
+      Map.get(record, :issue_url)
     ]
   end
 
@@ -259,7 +262,7 @@ defmodule CymphonyElixir.CompletionStore do
           {"""
            SELECT issue_id, identifier, project_name, ended_at, started_at, runtime_seconds,
                   input_tokens, output_tokens, total_tokens,
-                  worker_host, workspace_path, agent_kind, model
+                  worker_host, workspace_path, agent_kind, model, issue_url
              FROM sessions
             ORDER BY ended_at DESC
             LIMIT ?
@@ -269,7 +272,7 @@ defmodule CymphonyElixir.CompletionStore do
           {"""
            SELECT issue_id, identifier, project_name, ended_at, started_at, runtime_seconds,
                   input_tokens, output_tokens, total_tokens,
-                  worker_host, workspace_path, agent_kind, model
+                  worker_host, workspace_path, agent_kind, model, issue_url
              FROM sessions
             WHERE project_name = ?
             ORDER BY ended_at DESC
@@ -319,7 +322,8 @@ defmodule CymphonyElixir.CompletionStore do
          worker_host,
          workspace_path,
          agent_kind,
-         model
+         model,
+         issue_url
        ]) do
     %{
       issue_id: issue_id,
@@ -334,7 +338,8 @@ defmodule CymphonyElixir.CompletionStore do
       worker_host: worker_host,
       workspace_path: workspace_path,
       agent_kind: agent_kind,
-      model: model
+      model: model,
+      issue_url: issue_url
     }
   end
 

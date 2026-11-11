@@ -89,7 +89,8 @@ defmodule CymphonyElixirWeb.Presenter do
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       agent_kind: Map.get(entry, :agent_kind),
-      model: Map.get(entry, :model)
+      model: Map.get(entry, :model),
+      issue_url: Map.get(entry, :issue_url)
     }
   end
 

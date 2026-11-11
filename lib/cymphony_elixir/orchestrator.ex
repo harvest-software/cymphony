@@ -1898,9 +1898,13 @@ defmodule CymphonyElixir.Orchestrator do
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
       agent_kind: Map.get(running_entry, :agent_kind),
-      model: Map.get(running_entry, :model)
+      model: Map.get(running_entry, :model),
+      issue_url: completed_issue_url(running_entry)
     }
   end
+
+  defp completed_issue_url(%{issue: %{url: url}}) when is_binary(url) and url != "", do: url
+  defp completed_issue_url(_running_entry), do: nil
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do

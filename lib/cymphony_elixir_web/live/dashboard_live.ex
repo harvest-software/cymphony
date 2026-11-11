@@ -1385,7 +1385,13 @@ defmodule CymphonyElixirWeb.DashboardLive do
                   <article class="session-row session-row--completed">
                     <div class="session-row-summary">
                       <span class="session-row-disclosure" aria-hidden="true">✓</span>
-                      <div class="session-row-id"><%= entry.issue_identifier %></div>
+                      <div class="session-row-id">
+                        <%= if Map.get(entry, :issue_url) do %>
+                          <a href={entry.issue_url} target="_blank" rel="noopener" class="session-row-link"><%= entry.issue_identifier %></a>
+                        <% else %>
+                          <%= entry.issue_identifier %>
+                        <% end %>
+                      </div>
                       <div class="session-row-title muted small">
                         <%= if Map.get(entry, :project_name), do: entry.project_name, else: "" %>
                       </div>
@@ -2135,7 +2141,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
       <div class="alert-banner">
         <div class="alert-content">
           <strong>Stalled agents detected:</strong>
-          <%= @entries |> Enum.map(& &1.issue_identifier) |> Enum.join(", ") %>
+          <%= for {entry, index} <- Enum.with_index(@entries) do %><%= if index > 0 do %>, <% end %><%= if Map.get(entry, :issue_url) do %><a href={entry.issue_url} target="_blank" rel="noopener" class="session-row-link"><%= entry.issue_identifier %></a><% else %><%= entry.issue_identifier %><% end %><% end %>
           <%= if length(@entries) == 1 do %>
             has been stalled for <span data-clock="elapsed" data-base-seconds={stall_seconds(hd(@entries).last_event_at, @now)}><%= format_stall_duration(hd(@entries).last_event_at, @now) %></span>.
           <% else %>

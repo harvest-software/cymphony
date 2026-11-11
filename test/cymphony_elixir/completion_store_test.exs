@@ -164,6 +164,17 @@ defmodule CymphonyElixir.CompletionStoreTest do
   end
 
   describe "agent columns" do
+    # The dashboard links a completed run's issue number to its tracker page.
+    test "persists and reads the issue URL", %{path: path, name: name} do
+      {_pid, name} = start_store!(path: path, name: name)
+
+      put_record(name, issue_id: "linked", issue_url: "https://youtrack.example.com/issue/UAT-9")
+      :ok = sync(name)
+
+      assert [row] = CompletionStore.recent("p1", 10, name)
+      assert row.issue_url == "https://youtrack.example.com/issue/UAT-9"
+    end
+
     test "persists and reads agent_kind and model", %{path: path, name: name} do
       {_pid, name} = start_store!(path: path, name: name)
 
@@ -183,6 +194,7 @@ defmodule CymphonyElixir.CompletionStoreTest do
       assert [row] = CompletionStore.recent("p1", 10, name)
       assert row.agent_kind == nil
       assert row.model == nil
+      assert row.issue_url == nil
     end
   end
 
