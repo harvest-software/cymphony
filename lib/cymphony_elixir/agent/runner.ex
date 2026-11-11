@@ -468,42 +468,31 @@ defmodule CymphonyElixir.Agent.Runner do
         {:error, {:port_guard_exit, reason}}
 
       {^port, {:data, {:eol, chunk}}} ->
-        case append_output_chunk(buffer, chunk) do
+        case complete_output_line(buffer, chunk) do
           {:ok, line} ->
             log_stream_line(line)
             emit_line(on_message, line)
             collect_output(port, "", OutputWindow.push(window, line), config, on_message, eof?, guard_ref)
 
-          {:error, _} = error ->
-            stop_port(port)
-            error
+          :dropped ->
+            collect_output(port, "", window, config, on_message, eof?, guard_ref)
         end
 
       {^port, {:data, {:noeol, chunk}}} ->
-        case append_output_chunk(buffer, chunk) do
-          {:ok, next_buffer} ->
-            collect_output(port, next_buffer, window, config, on_message, eof?, guard_ref)
-
-          {:error, _} = error ->
-            stop_port(port)
-            error
-        end
+        collect_output(port, append_output_chunk(buffer, chunk), window, config, on_message, eof?, guard_ref)
 
       {^port, :eof} ->
         collect_output(port, buffer, window, config, on_message, true, guard_ref)
 
       {^port, {:exit_status, status}} ->
-        drained =
+        {:ok, buffer, window} =
           if eof? do
             {:ok, buffer, window}
           else
             drain_port_until_eof(port, buffer, window, on_message)
           end
 
-        case drained do
-          {:ok, buffer, window} -> finalize_collected_output(status, buffer, window, on_message)
-          {:error, _} = error -> error
-        end
+        finalize_collected_output(status, buffer, window, on_message)
     after
       timeout_ms ->
         stop_port(port)
@@ -514,26 +503,18 @@ defmodule CymphonyElixir.Agent.Runner do
   defp drain_port_until_eof(port, buffer, window, on_message) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
-        case append_output_chunk(buffer, chunk) do
+        case complete_output_line(buffer, chunk) do
           {:ok, line} ->
             log_stream_line(line)
             emit_line(on_message, line)
             drain_port_until_eof(port, "", OutputWindow.push(window, line), on_message)
 
-          {:error, _} = error ->
-            stop_port(port)
-            error
+          :dropped ->
+            drain_port_until_eof(port, "", window, on_message)
         end
 
       {^port, {:data, {:noeol, chunk}}} ->
-        case append_output_chunk(buffer, chunk) do
-          {:ok, next_buffer} ->
-            drain_port_until_eof(port, next_buffer, window, on_message)
-
-          {:error, _} = error ->
-            stop_port(port)
-            error
-        end
+        drain_port_until_eof(port, append_output_chunk(buffer, chunk), window, on_message)
 
       {^port, :eof} ->
         {:ok, buffer, window}
@@ -543,15 +524,42 @@ defmodule CymphonyElixir.Agent.Runner do
     end
   end
 
+  # A line longer than @max_retained_line_bytes is not kept: from the chunk that
+  # crosses the bound until its newline, the buffer is `{:oversized, bytes}`
+  # and the rest is counted, not stored, so memory stays bounded however long
+  # the line runs. Such lines are tool results (an image read as base64 is
+  # several hundred KB on one line), never the session, usage-limit or result
+  # lines the orchestrator reads, so a terminated one is dropped with a warning
+  # and the run carries on; failing the run left an agent that read a
+  # screenshot unable to finish, or even to resume.
+  defp append_output_chunk({:oversized, bytes}, chunk), do: {:oversized, bytes + IO.iodata_length(chunk)}
+
   defp append_output_chunk(buffer, chunk) do
     chunk = to_string(chunk)
+    size = byte_size(buffer) + byte_size(chunk)
 
-    if byte_size(buffer) + byte_size(chunk) <= @max_retained_line_bytes do
-      {:ok, buffer <> chunk}
-    else
-      {:error, :agent_output_line_too_large}
+    if size <= @max_retained_line_bytes, do: buffer <> chunk, else: {:oversized, size}
+  end
+
+  defp complete_output_line(buffer, chunk) do
+    case append_output_chunk(buffer, chunk) do
+      {:oversized, bytes} ->
+        Logger.warning("Dropped an agent output line of #{bytes} bytes (over #{@max_retained_line_bytes}); typically a tool result such as an image")
+
+        :dropped
+
+      line ->
+        {:ok, line}
     end
   end
+
+  # An oversized line still open when the CLI exits is not a dropped tool
+  # result but output that never ended, and there is no result line to parse.
+  defp finalize_collected_output(0, {:oversized, _bytes}, _window, _on_message),
+    do: {:error, :agent_output_line_too_large}
+
+  defp finalize_collected_output(status, {:oversized, _bytes}, window, on_message),
+    do: finalize_collected_output(status, "", window, on_message)
 
   defp finalize_collected_output(0, buffer, window, on_message) do
     remaining = buffer |> to_string() |> String.trim()

@@ -28,6 +28,50 @@ defmodule CymphonyElixir.AgentOutputRetentionIntegrationTest do
     end
   end
 
+  # An image read by the agent comes back as one base64 JSON line of several
+  # hundred KB. Failing the run on it left an agent that read a screenshot
+  # unable to finish or resume; the line is dropped and the run carries on.
+  test "runner drops a terminated oversized line and still returns the result" do
+    test_root = Path.join(System.tmp_dir!(), "cymphony-output-drop-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-4903")
+    cli = Path.join(test_root, "fake-claude")
+
+    try do
+      File.mkdir_p!(workspace)
+
+      File.write!(cli, """
+      #!/bin/sh
+      echo '{"type":"system","subtype":"init","session_id":"sess-image"}'
+      awk 'BEGIN{printf "{\\"type\\":\\"user\\",\\"image\\":\\""; for(i=0;i<600000;i++) printf "A"; print "\\"}"}'
+      echo '{"type":"assistant","message":"after the image"}'
+      echo '{"result":"done after image","session_id":"sess-image"}'
+      """)
+
+      File.chmod!(cli, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, claude_command: cli)
+
+      issue = %Issue{
+        id: "issue-output-line-drop",
+        identifier: "MT-4903",
+        title: "Drop a giant line",
+        description: "An image tool result must not end the run",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-4903"
+      }
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, %{session_id: "sess-image", result: result}} = Runner.run(workspace, "run", issue)
+          assert result.result == "done after image"
+        end)
+
+      assert log =~ "Dropped an agent output line of"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "runner preserves parsed Codex result but emits only a bounded retained transcript" do
     test_root = Path.join(System.tmp_dir!(), "cymphony-output-window-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(test_root, "workspaces")
