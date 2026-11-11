@@ -81,6 +81,27 @@ defmodule CymphonyElixir.Agent.StreamSignals do
 
   def usage_limit(_line, _now_unix), do: nil
 
+  @doc """
+  Whether `line` is the model's own output for the given agent kind: proof the
+  provider accepted the request, so its usage window is open again.
+
+  A refused run never gets this far. Claude prints its `init` event and then
+  the `rate_limit_event`, both before any `assistant` event; Codex emits
+  `item.*` events only for what the model produced. Antigravity's stream is
+  not recognised, so it never clears a limit early.
+  """
+  @spec model_output?(String.t(), String.t()) :: boolean()
+  def model_output?("claude", line) when is_binary(line) do
+    String.contains?(line, "\"assistant\"") and match?(%{"type" => "assistant"}, decode(line))
+  end
+
+  def model_output?("codex", line) when is_binary(line) do
+    String.contains?(line, "\"item.") and
+      match?(%{"type" => "item." <> _}, decode(line))
+  end
+
+  def model_output?(_kind, _line), do: false
+
   defp rate_limit_event(line) do
     case decode(line) do
       %{"type" => "rate_limit_event", "rate_limit_info" => %{"status" => "rejected"} = info} ->

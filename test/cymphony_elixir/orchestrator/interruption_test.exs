@@ -212,6 +212,41 @@ defmodule CymphonyElixir.Orchestrator.InterruptionTest do
       {:noreply, state} = Orchestrator.handle_info({:agent_worker_update, "MT-5", update}, state)
       assert state.usage_limits == %{}
     end
+
+    # A run that ends by moving its issue to review is stopped before its turn
+    # completes, so the model's first output has to be enough. Without this the
+    # park outlived the window and held every waiting issue (UAT-8/9/13).
+    test "the model's first output on a limited provider clears its limit" do
+      ref = make_ref()
+
+      state =
+        base_state(%{
+          running: %{"MT-6" => running_entry("MT-6", ref, %{provider: "cz1"})},
+          usage_limits: %{{"claude", "cz1"} => System.os_time(:second) + 600, {"codex", nil} => System.os_time(:second) + 600}
+        })
+
+      update = %{event: :agent_responded, timestamp: DateTime.utc_now()}
+      {:noreply, state} = quietly(fn -> Orchestrator.handle_info({:agent_worker_update, "MT-6", update}, state) end)
+
+      # Only the limit on the provider that answered; another agent's stays.
+      assert Map.keys(state.usage_limits) == [{"codex", nil}]
+    end
+
+    # Claude prints its init event, session id and all, before it is refused.
+    test "an identified session alone does not clear a limit" do
+      ref = make_ref()
+      resets_at = System.os_time(:second) + 600
+
+      state =
+        base_state(%{
+          running: %{"MT-7" => running_entry("MT-7", ref, %{provider: "cz1"})},
+          usage_limits: %{{"claude", "cz1"} => resets_at}
+        })
+
+      update = %{event: :session_identified, session_id: "sess-MT-7", timestamp: DateTime.utc_now()}
+      {:noreply, state} = Orchestrator.handle_info({:agent_worker_update, "MT-7", update}, state)
+      assert state.usage_limits == %{{"claude", "cz1"} => resets_at}
+    end
   end
 
   describe "resumable sessions" do

@@ -95,4 +95,29 @@ defmodule CymphonyElixir.Agent.StreamSignalsTest do
       assert StreamSignals.usage_limit(nil, @now) == nil
     end
   end
+
+  describe "model_output?/2" do
+    test "Claude's assistant events are the model's output" do
+      assert StreamSignals.model_output?("claude", ~s({"type":"assistant","message":{"role":"assistant"},"session_id":"s"}))
+    end
+
+    # A refused run prints init and the rejection, both before any assistant
+    # event: neither may lift a usage-limit park.
+    test "Claude's init, rate-limit, user and result events are not" do
+      refute StreamSignals.model_output?("claude", ~s({"type":"system","subtype":"init","session_id":"s"}))
+      refute StreamSignals.model_output?("claude", @rejected)
+      refute StreamSignals.model_output?("claude", ~s({"type":"user","message":{"role":"assistant"}}))
+      refute StreamSignals.model_output?("claude", ~s(not json but mentions "assistant"))
+    end
+
+    test "Codex item events are the model's output; thread and turn markers are not" do
+      assert StreamSignals.model_output?("codex", ~s({"type":"item.completed","item":{"type":"agent_message"}}))
+      refute StreamSignals.model_output?("codex", ~s({"type":"thread.started","thread_id":"t"}))
+      refute StreamSignals.model_output?("codex", ~s({"type":"turn.started"}))
+    end
+
+    test "an unrecognised kind never counts" do
+      refute StreamSignals.model_output?("antigravity", ~s({"type":"assistant"}))
+    end
+  end
 end

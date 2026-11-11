@@ -2377,11 +2377,22 @@ defmodule CymphonyElixir.Orchestrator do
     end
   end
 
-  # A completed turn on a limited {agent, provider} proves the window is open
-  # again, whatever the recorded reset time said.
-  defp clear_usage_limit_on_success(%State{} = state, running_entry, %{event: :turn_completed}) do
+  # Output from the model, or a completed turn, on a limited {agent, provider}
+  # proves the window is open again, whatever the recorded reset time said.
+  # `:agent_responded` is what usually does it: a run that ends by moving its
+  # issue to review is stopped before its turn completes. The park is durable,
+  # so lifting it is checkpointed at once; otherwise a restart would bring it
+  # back from the file and hold the project until the old reset time.
+  defp clear_usage_limit_on_success(%State{} = state, running_entry, %{event: event})
+       when event in [:turn_completed, :agent_responded] do
     key = {Map.get(running_entry, :agent_kind), Map.get(running_entry, :provider)}
-    %{state | usage_limits: Map.delete(state.usage_limits, key)}
+
+    if Map.has_key?(state.usage_limits, key) do
+      Logger.info("Usage limit lifted for agent=#{elem(key, 0)} provider=#{inspect(elem(key, 1))}: the model is responding again")
+      checkpoint(%{state | usage_limits: Map.delete(state.usage_limits, key)})
+    else
+      state
+    end
   end
 
   defp clear_usage_limit_on_success(state, _running_entry, _update), do: state

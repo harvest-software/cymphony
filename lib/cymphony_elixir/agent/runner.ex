@@ -432,7 +432,7 @@ defmodule CymphonyElixir.Agent.Runner do
 
   defp await_process_completion(port, on_message, metadata, run_spec, agent_module, config, guard_ref) do
     wrapped = wrap_on_message(on_message, metadata)
-    Process.put(@stream_signals_key, %{kind: run_spec.kind, session_id: nil, usage_limit: nil})
+    Process.put(@stream_signals_key, %{kind: run_spec.kind, session_id: nil, usage_limit: nil, responded: false})
 
     case collect_output(port, config, wrapped, guard_ref) do
       {:ok, lines} ->
@@ -603,10 +603,27 @@ defmodule CymphonyElixir.Agent.Runner do
         signals
         |> observe_session_id(StreamSignals.session_id(kind, line), on_message)
         |> observe_usage_limit(StreamSignals.usage_limit(line, System.os_time(:second)), on_message)
+        |> observe_response(kind, line, on_message)
         |> then(&Process.put(@stream_signals_key, &1))
 
       _ ->
         :ok
+    end
+  end
+
+  # The model's first output in a run proves its provider accepted the request,
+  # which is what lets the orchestrator lift a usage-limit park. Waiting for
+  # `:turn_completed` alone missed every run that ends by moving its issue to
+  # review: the orchestrator stops those before the CLI finishes its turn.
+  # Reported once per run; the check is skipped after that.
+  defp observe_response(%{responded: true} = signals, _kind, _line, _on_message), do: signals
+
+  defp observe_response(signals, kind, line, on_message) do
+    if StreamSignals.model_output?(kind, line) do
+      on_message.(%{event: :agent_responded, timestamp: DateTime.utc_now()})
+      %{signals | responded: true}
+    else
+      signals
     end
   end
 

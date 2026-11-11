@@ -72,6 +72,72 @@ defmodule CymphonyElixir.AgentOutputRetentionIntegrationTest do
     end
   end
 
+  # :agent_responded is what lifts a usage-limit park, so it must come from the
+  # model's own output, once per run, and never from a refused run.
+  describe "agent_responded" do
+    defp run_collecting(body, identifier) do
+      test_root = Path.join(System.tmp_dir!(), "cymphony-responded-#{System.unique_integer([:positive])}")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, identifier)
+      cli = Path.join(test_root, "fake-claude")
+
+      try do
+        File.mkdir_p!(workspace)
+        File.write!(cli, "#!/bin/sh\n" <> body)
+        File.chmod!(cli, 0o755)
+        write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, claude_command: cli)
+
+        issue = %Issue{
+          id: "issue-#{identifier}",
+          identifier: identifier,
+          title: "Responded",
+          description: "d",
+          state: "In Progress",
+          url: "https://example.org/issues/#{identifier}"
+        }
+
+        {:ok, collector} = Agent.start_link(fn -> [] end)
+        on_message = fn message -> Agent.update(collector, &[message.event | &1]) end
+        result = ExUnit.CaptureLog.with_log(fn -> Runner.run(workspace, "run", issue, on_message: on_message) end)
+        {result, Agent.get(collector, &Enum.reverse/1)}
+      after
+        File.rm_rf(test_root)
+      end
+    end
+
+    test "is reported once, on the model's first output" do
+      {{result, _log}, events} =
+        run_collecting(
+          """
+          echo '{"type":"system","subtype":"init","session_id":"s1"}'
+          echo '{"type":"assistant","message":{"role":"assistant"},"session_id":"s1"}'
+          echo '{"type":"assistant","message":{"role":"assistant"},"session_id":"s1"}'
+          echo '{"result":"ok","session_id":"s1"}'
+          """,
+          "MT-4904"
+        )
+
+      assert {:ok, _} = result
+      assert Enum.count(events, &(&1 == :agent_responded)) == 1
+    end
+
+    test "is never reported for a run refused by its usage limit" do
+      {{result, _log}, events} =
+        run_collecting(
+          """
+          echo '{"type":"system","subtype":"init","session_id":"s2"}'
+          echo '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1791333000,"rateLimitType":"five_hour"},"session_id":"s2"}'
+          exit 1
+          """,
+          "MT-4905"
+        )
+
+      assert {:error, {:usage_limit, _}} = result
+      assert :usage_limit in events
+      refute :agent_responded in events
+    end
+  end
+
   test "runner preserves parsed Codex result but emits only a bounded retained transcript" do
     test_root = Path.join(System.tmp_dir!(), "cymphony-output-window-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(test_root, "workspaces")
