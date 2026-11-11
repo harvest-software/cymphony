@@ -324,6 +324,26 @@ defmodule CymphonyElixir.DependencyGateTest do
       assert DependencyGate.forge_verdict({"  \n", 0}, "gh", "a", "b") == :blocked
     end
 
+    test "reads glab's JSON listing: rows are merged, an empty array is blocked" do
+      # glab prints `[]` when no merged MR matches. Read as non-blank text it
+      # looked like a row, so a dependency counted as merged the moment its
+      # branch was pushed.
+      assert DependencyGate.forge_verdict({~s([{"iid": 6, "state": "merged"}]\n), 0}, "glab", "a", "b") == :merged
+      assert DependencyGate.forge_verdict({"[]", 0}, "glab", "a", "b") == :blocked
+      assert DependencyGate.forge_verdict({"[]\n", 0}, "glab", "a", "b") == :blocked
+    end
+
+    test "glab output that isn't a JSON array is unknown, never merged" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert DependencyGate.forge_verdict({"A new version of glab is available\n[]", 0}, "glab", "a", "b") == :unknown
+          assert DependencyGate.forge_verdict({~s({"iid": 6}), 0}, "glab", "a", "b") == :unknown
+          assert DependencyGate.forge_verdict({"", 0}, "glab", "a", "b") == :unknown
+        end)
+
+      assert log =~ "unexpected output cli=glab"
+    end
+
     test "an erroring or unreachable CLI is unknown, never blocked" do
       # Failing closed here would let an unavailable forge wedge an epic with
       # nothing to show an operator why.
@@ -346,7 +366,9 @@ defmodule CymphonyElixir.DependencyGateTest do
       File.write!(glab, """
       #!/bin/sh
       if [ "$GITLAB_HOST" = "gitlab.example.com" ] && [ "$GITLAB_TOKEN" = "t0ken" ]; then
-        echo '[{"iid": 1}]'
+        # Like the real glab: rows for a merged MR, `[]` when none matches.
+        # $4 is the --source-branch value.
+        if [ "$4" = "HFE-6472" ]; then echo '[{"iid": 1}]'; else echo '[]'; fi
         exit 0
       fi
       echo 'none of the git remotes configured for this repository point to a known GitLab host' >&2
@@ -370,6 +392,8 @@ defmodule CymphonyElixir.DependencyGateTest do
 
       env = CymphonyElixir.ForgeEnv.cli_env("gitlab", "t0ken", "gitlab.example.com")
       assert DependencyGate.forge_cli_merged?(root, "gitlab", "HFE-6472", "HFE-6470", env) == :merged
+      # A pushed branch with no merged MR: glab answers `[]`, which must block.
+      assert DependencyGate.forge_cli_merged?(root, "gitlab", "HFE-6473", "HFE-6470", env) == :blocked
 
       # Without the project's host the CLI sees only the daemon's environment.
       log =

@@ -298,10 +298,29 @@ defmodule CymphonyElixir.DependencyGate do
   be testing the machine rather than the gate.
   """
   @spec forge_verdict({String.t(), non_neg_integer()} | :error, String.t(), String.t(), String.t()) :: verdict()
+  def forge_verdict({output, 0}, "glab", dep_branch, base_branch) do
+    # `glab mr list --output json` prints a JSON array, and `[]` when nothing
+    # matches: that is the empty listing, not a row. Reading any non-blank
+    # output as merged released every dependent as soon as its dependency's
+    # branch was pushed, long before it merged.
+    case Jason.decode(output) do
+      {:ok, []} ->
+        :blocked
+
+      {:ok, [_ | _]} ->
+        :merged
+
+      _ ->
+        Logger.warning("Forge merge check returned unexpected output cli=glab branch=#{dep_branch} base=#{base_branch} output=#{inspect(String.slice(output, 0, 500))}")
+
+        :unknown
+    end
+  end
+
   def forge_verdict({output, 0}, _cli, _dep_branch, _base_branch) do
-    # A listing with any row means a review from this branch into this base was
-    # merged; an empty one means there is none, which is the squash case's only
-    # honest "no".
+    # gh's query prints one PR number per merged PR (`--jq '.[].number'`), so
+    # any line means a review from this branch into this base was merged; no
+    # output means there is none, which is the squash case's only honest "no".
     if String.trim(output) == "", do: :blocked, else: :merged
   end
 
