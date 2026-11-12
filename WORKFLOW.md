@@ -152,7 +152,8 @@ This flow applies when the issue is moved back from `Human Review` to `In Progre
    - Ignore the active `## Claude Workpad` comment.
    - Ignore comments authored by the agent/service account or comments that are only agent progress notes.
    - Ignore comments already represented by the workpad checkpoint.
-4. Maintain this exact checkpoint line in the workpad `Notes` section after each re-entry run:
+{% if workflow.ignored_comment_authors.size > 0 %}   - Ignore every comment written by {% for login in workflow.ignored_comment_authors %}`{{ login }}`{% unless forloop.last %}, {% endunless %}{% endfor %}, whatever its heading or content: those accounts post automated status, never requests for change. Decide by the comment's author, not its heading; a comment by anyone else is a normal comment.
+{% endif %}4. Maintain this exact checkpoint line in the workpad `Notes` section after each re-entry run:
    - `Last processed human comment: <comment id or timestamp>`
 5. If there is no checkpoint yet, process the relevant human comments that are not already reflected in the current workpad plan, acceptance criteria, or validation notes.
 6. Add every actionable new human request to the workpad plan/checklist before implementing it.

@@ -294,7 +294,8 @@ defmodule CymphonyElixir.PromptBuilder do
       "merge_state" => blank_to_nil(tracker.merge_state),
       "active_states" => active,
       "other_active_states" => other_active_states(active, tracker),
-      "terminal_states" => state_list(tracker.terminal_states, ["Done"])
+      "terminal_states" => state_list(tracker.terminal_states, ["Done"]),
+      "ignored_comment_authors" => state_list(tracker.ignored_comment_authors, [])
     }
   end
 
@@ -306,7 +307,8 @@ defmodule CymphonyElixir.PromptBuilder do
       "merge_state" => "Merging",
       "active_states" => ["Todo", "In Progress"],
       "other_active_states" => [],
-      "terminal_states" => ["Done"]
+      "terminal_states" => ["Done"],
+      "ignored_comment_authors" => []
     }
   end
 

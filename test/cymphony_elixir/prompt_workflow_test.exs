@@ -170,4 +170,42 @@ defmodule CymphonyElixir.PromptWorkflowTest do
       assert PromptBuilder.tracker_variables(nil)["name"] == "Linear"
     end
   end
+
+  describe "ignored comment authors (UAT-15)" do
+    defp with_ignored(attrs, logins), do: put_in(attrs, ["tracker", "ignored_comment_authors"], logins)
+
+    test "the rule names the ignored login and is keyed on the author, not the heading" do
+      prompt = render(with_ignored(@youtrack, ["software.uat"]))
+
+      assert prompt =~ "Ignore every comment written by `software.uat`, whatever its heading or content"
+      assert prompt =~ "Decide by the comment's author login"
+      assert prompt =~ "author(login)"
+      # Inverse: a human comment, even one with the bot's heading, still counts.
+      assert prompt =~ "A comment by anyone else is a normal comment, even when it starts with the same heading."
+      # The existing human-comment intake is still there beside it.
+      assert prompt =~ "Identify new actionable human comments"
+    end
+
+    test "several logins are listed" do
+      prompt = render(with_ignored(@youtrack, ["software.uat", "ci.bot"]))
+
+      assert prompt =~ "written by `software.uat`, `ci.bot`, whatever"
+    end
+
+    test "with no ignored authors the rule is absent" do
+      for attrs <- [@youtrack, with_ignored(@youtrack, []), @linear] do
+        prompt = render(attrs)
+
+        refute prompt =~ "Ignore every comment written by"
+        refute prompt =~ "author(login)"
+      end
+    end
+
+    test "the YouTrack field hint does not leak into a Linear prompt" do
+      prompt = render(with_ignored(@linear, ["software.uat"]))
+
+      assert prompt =~ "Ignore every comment written by `software.uat`"
+      refute prompt =~ "author(login)"
+    end
+  end
 end

@@ -181,6 +181,10 @@ defmodule CymphonyElixir.Config.Schema do
       # equivalent field and leaves it unset.
       field(:version_field, :string, default: "Version")
       field(:merge_to_parent_version, :string, default: "Merge to Parent Feature Branch")
+      # Tracker logins whose comments the agent skips on review re-entry, by
+      # author and never by heading: an automated account (the UAT portal's
+      # `## UAT Review` summaries) writes status, not requests for change.
+      field(:ignored_comment_authors, {:array, :string}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -204,7 +208,8 @@ defmodule CymphonyElixir.Config.Schema do
           :scope_issue,
           :feature_branch_label,
           :version_field,
-          :merge_to_parent_version
+          :merge_to_parent_version,
+          :ignored_comment_authors
         ],
         empty_values: []
       )

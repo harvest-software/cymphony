@@ -1004,6 +1004,33 @@ defmodule CymphonyElixir.Cymphony.Config do
     |> maybe_put_string(config, "endpoint", "tracker_endpoint")
     |> maybe_put_string(config, "assignee", "tracker_assignee")
     |> maybe_put_string(config, "scope_issue", "scope_issue")
+    |> maybe_put_ignored_comment_authors(config)
+  end
+
+  # Logins whose comments the agent skips on review re-entry. Emitted only when
+  # set, so every config without it generates byte-identical front matter. An
+  # empty list is a valid "none"; anything that is not a list of strings warns
+  # and is dropped, because a mistyped login is otherwise invisible until the
+  # agent turns a bot's status comment into rework.
+  defp maybe_put_ignored_comment_authors(tracker, config) do
+    case Map.get(config, "ignored_comment_authors") do
+      nil -> tracker
+      value -> put_ignored_comment_authors(tracker, value, string_list?(value))
+    end
+  end
+
+  defp string_list?(value), do: is_list(value) and Enum.all?(value, &is_binary/1)
+
+  defp put_ignored_comment_authors(tracker, value, false), do: warn_invalid_ignored_comment_authors(tracker, value)
+  defp put_ignored_comment_authors(tracker, value, true), do: put_ignored_comment_authors(tracker, normalize_state_list(value))
+
+  defp put_ignored_comment_authors(tracker, []), do: tracker
+  defp put_ignored_comment_authors(tracker, logins), do: Map.put(tracker, "ignored_comment_authors", logins)
+
+  defp warn_invalid_ignored_comment_authors(tracker, value) do
+    Logger.warning("Ignoring invalid ignored_comment_authors in config.json: #{inspect(value)}")
+
+    tracker
   end
 
   # Which code-hosting platform the repo lives on. Drives the prompt's CLI and

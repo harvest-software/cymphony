@@ -261,6 +261,29 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
       assert parsed.tracker.active_states == ["Open", "In Progress"]
     end
 
+    test "ignored_comment_authors is emitted only when set, and survives Schema.parse" do
+      refute Map.has_key?(CymphonyConfig.to_schema_map(%{})["tracker"], "ignored_comment_authors")
+      refute Map.has_key?(CymphonyConfig.to_schema_map(%{"ignored_comment_authors" => []})["tracker"], "ignored_comment_authors")
+
+      map = CymphonyConfig.to_schema_map(%{"ignored_comment_authors" => [" software.uat ", "", "software.uat"]})
+
+      assert map["tracker"]["ignored_comment_authors"] == ["software.uat"]
+      assert {:ok, %Schema{} = parsed} = Schema.parse(map)
+      assert parsed.tracker.ignored_comment_authors == ["software.uat"]
+    end
+
+    test "an invalid ignored_comment_authors warns and is dropped" do
+      for bad <- ["software.uat", ["software.uat", 1], %{"a" => "b"}, 7] do
+        log =
+          capture_log(fn ->
+            map = CymphonyConfig.to_schema_map(%{"ignored_comment_authors" => bad})
+            refute Map.has_key?(map["tracker"], "ignored_comment_authors")
+          end)
+
+        assert log =~ "Ignoring invalid ignored_comment_authors"
+      end
+    end
+
     test "an invalid state list warns and keeps the default" do
       # A mistyped list either polls nothing or treats finished work as
       # running, so it must never reach the front matter silently.

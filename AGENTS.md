@@ -812,6 +812,23 @@ likewise per-project config keys now; only a list of strings is honored,
 anything else warns and keeps the default (a mistyped list either polls
 nothing or treats finished work as running).
 
+### Ignored comment authors (`ignored_comment_authors`)
+
+A `projects[]` list of tracker logins (`"ignored_comment_authors": ["software.uat"]`), generated
+into `tracker.ignored_comment_authors` and rendered by `PromptBuilder.workflow_variables/1`. On
+review re-entry the agent skips every comment those accounts wrote — the UAT portal's
+`## UAT Review · UAT-n` summaries are status, not requests for change (UAT-15); UAT failures reach
+the agent only through the human comment written when the issue is sent back.
+
+- **By author, never by heading.** A human comment that happens to start `## UAT Review` is a
+  normal comment, and the ignored account's comments are skipped whatever they say. On YouTrack the
+  prompt tells the agent to request `author(login)` with each comment, or it would only see text.
+- The filter is prompt text, not Elixir: the agent fetches comments itself. Tests assert the
+  rendered rule (`prompt_workflow_test.exs`), not agent behaviour.
+- Emitted only when set, so a config without it generates byte-identical front matter, and the
+  bullet is absent from the prompt. An empty list means none; anything other than a list of strings
+  warns (`Ignoring invalid ignored_comment_authors`) and is dropped.
+
 ## Workflow states are config, and so is the prompt's status map
 
 The prompt used to hardcode Linear's `Backlog`/`Todo`/`In Progress`/
